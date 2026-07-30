@@ -8,7 +8,7 @@ const { spawn } = require('child_process');
 const https = require('https');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 7860;
 const API_URL = process.env.API_URL || 'http://localhost:8000';
 
 // TMDB for metadata (set TMDB_API_KEY env var for production)
