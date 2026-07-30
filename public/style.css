@@ -1587,3 +1587,46 @@ body {
   .hero-play-btn { padding: 10px 20px; font-size: 13px; }
   .hero-arrow { width: 38px; height: 38px; }
 }
+
+/* --- Categories / Genre browser --- */
+.categories-page { padding-bottom: 40px; }
+.page-heading { font-size: 26px; font-weight: 700; margin: 8px 0 24px; color: #fff; }
+.genre-group { margin-bottom: 32px; }
+.genre-group-title { font-size: 18px; font-weight: 600; color: rgba(255,255,255,0.85); margin-bottom: 14px; }
+.genre-chip-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 12px;
+}
+.genre-chip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 16px;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 12px;
+  color: #fff;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+.genre-chip:hover {
+  background: rgba(29,185,84,0.18);
+  border-color: #1db954;
+  transform: translateY(-2px);
+}
+.genre-chip-icon { font-size: 20px; }
+.genre-chip-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.row-subtitle { color: rgba(255,255,255,0.55); font-size: 13px; margin: -8px 0 14px 4px; }
+
+/* --- Audio (dub) selector on detail page --- */
+.dub-tabs { margin-bottom: 14px; }
+.dub-tab { text-transform: none !important; }
+
+@media (max-width: 768px) {
+  .genre-chip-grid { grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 8px; }
+  .genre-chip { padding: 10px 12px; font-size: 12px; }
+  .page-heading { font-size: 20px; }
+}

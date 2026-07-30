@@ -606,6 +606,43 @@ app.get('/api/top-imdb', async (req, res) => {
   })) });
 });
 
+// Dubbed content (Hindi etc.) — discovery feed from Moviebox-API
+app.get('/api/dubbed', async (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const language = req.query.language || 'Hindi';
+  const data = await movieboxFetch(`/dubbed?language=${encodeURIComponent(language)}&page=${page}`);
+  if (!data) return res.json({ items: [] });
+  res.json({ page, language: data.language || language, items: (data.items || []).map(item => ({
+    subject_id: item.subject_id, name: item.name, poster_url: item.poster_url || '',
+    slug: item.slug, badge: item.badge || '', rating: item.rating || null,
+    subject_type: item.subject_type,
+  })) });
+});
+
+// Genre browsing — pooled per-type feeds filtered server-side by genre field
+app.get('/api/genres', async (req, res) => {
+  const data = await movieboxFetch('/genres');
+  res.json(data || { genres: [], types: ['movie', 'tv', 'animation'] });
+});
+
+app.get('/api/genre/:name', async (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const type = ['movie', 'tv', 'animation'].includes(req.query.type) ? req.query.type : 'movie';
+  const name = req.params.name;
+  const data = await movieboxFetch(`/genre/${encodeURIComponent(name)}?type=${type}&page=${page}`);
+  if (!data) return res.json({ items: [] });
+  res.json({
+    genre: name, type, page,
+    total: data.total || 0,
+    has_more: !!data.has_more,
+    items: (data.items || []).map(item => ({
+      subject_id: item.subject_id, name: item.name, poster_url: item.poster_url || '',
+      slug: item.slug, badge: item.badge || '', rating: item.rating || null,
+      subject_type: item.subject_type,
+    })),
+  });
+});
+
 // --- Moviebox-API helper ---
 async function movieboxFetch(endpoint) {
   try {

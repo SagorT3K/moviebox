@@ -355,6 +355,8 @@ async function loadPage() {
   if (window.__sectionScrollHandler) { window.removeEventListener('scroll', window.__sectionScrollHandler); window.__sectionScrollHandler = null; }
   if (window.__mwScrollHandler) { window.removeEventListener('scroll', window.__mwScrollHandler); window.__mwScrollHandler = null; }
   if (window.__imdbScrollHandler) { window.removeEventListener('scroll', window.__imdbScrollHandler); window.__imdbScrollHandler = null; }
+  if (window.__hindiScrollHandler) { window.removeEventListener('scroll', window.__hindiScrollHandler); window.__hindiScrollHandler = null; }
+  if (window.__genreScrollHandler) { window.removeEventListener('scroll', window.__genreScrollHandler); window.__genreScrollHandler = null; }
   stopCurrentTranscode();
   destroyPlayers();
 
@@ -374,6 +376,10 @@ async function loadPage() {
     await loadMostWatchedPage();
   } else if (currentPage === 'top-imdb') {
     await loadTopImdbPage();
+  } else if (currentPage === 'hindi') {
+    await loadHindiPage();
+  } else if (currentPage === 'categories') {
+    await loadCategoriesPage();
   } else {
     await loadHomePage();
   }
@@ -1160,6 +1166,180 @@ async function loadMoreTopImdb() {
   imdbState.loading = false;
 }
 
+// --- Hindi Dubbed page (dual-audio discovery) ---
+let hindiState = { page: 1, loading: false, done: false };
+
+async function loadHindiPage() {
+  hindiState = { page: 1, loading: false, done: false };
+
+  contentArea.innerHTML = `<div class="movie-row">
+    <div class="row-header"><h2 class="row-title">🇮🇳 Hindi Dubbed</h2></div>
+    <p class="row-subtitle">Movies & TV shows with a Hindi audio track</p>
+    <div class="movie-grid" id="hindiGrid"></div>
+    <div class="mt-loading" id="hindiLoading">Loading...</div>
+  </div>`;
+
+  await loadMoreHindi();
+
+  window.__hindiScrollHandler = async () => {
+    const el = document.getElementById('hindiLoading');
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    if (rect.top < window.innerHeight + 300) await loadMoreHindi();
+  };
+  window.addEventListener('scroll', window.__hindiScrollHandler, { passive: true });
+}
+
+async function loadMoreHindi() {
+  if (hindiState.loading || hindiState.done) return;
+  hindiState.loading = true;
+
+  const grid = document.getElementById('hindiGrid');
+  const loadEl = document.getElementById('hindiLoading');
+  if (loadEl) loadEl.textContent = 'Loading more...';
+
+  try {
+    const data = await apiFetch(`/api/dubbed?language=Hindi&page=${hindiState.page}`);
+    const items = (data.items || []).map(it => ({
+      id: it.subject_id, title: it.name || 'Untitled', poster: it.poster_url || '',
+      slug: it.slug, badge: it.badge || '', rating: it.rating || null,
+      source: 'moviebox', type: 'moviebox',
+    }));
+
+    if (!items.length) {
+      hindiState.done = true;
+      if (loadEl) { loadEl.textContent = hindiState.page === 1 ? 'No Hindi dubbed content found.' : 'You have reached the end.'; loadEl.classList.add('mt-end'); }
+      hindiState.loading = false;
+      return;
+    }
+
+    if (grid) { grid.insertAdjacentHTML('beforeend', items.map(renderCard).join('')); attachCardListeners(); }
+    hindiState.page += 1;
+    if (hindiState.page > 30) {
+      hindiState.done = true;
+      if (loadEl) { loadEl.textContent = 'You have reached the end.'; loadEl.classList.add('mt-end'); }
+    }
+  } catch (e) {
+    hindiState.done = true;
+    if (loadEl) { loadEl.textContent = 'Failed to load more.'; loadEl.classList.add('mt-end'); }
+  }
+  hindiState.loading = false;
+}
+
+// --- Categories page (genre browser) ---
+const CATEGORY_GENRES = {
+  movie: ['Action', 'Adventure', 'Animation', 'Comedy', 'Crime', 'Documentary', 'Drama', 'Family', 'Fantasy', 'History', 'Horror', 'Kids', 'Music', 'Mystery', 'Romance', 'Sci-Fi', 'Sport', 'Thriller', 'War', 'Western'],
+  tv: ['Action', 'Adventure', 'Animation', 'Anime', 'Comedy', 'Crime', 'Documentary', 'Drama', 'Family', 'Fantasy', 'History', 'Horror', 'Kids', 'Mystery', 'Reality', 'Romance', 'Sci-Fi', 'Talk', 'Thriller', 'War'],
+  animation: ['Action', 'Adventure', 'Anime', 'Comedy', 'Drama', 'Family', 'Fantasy', 'Horror', 'Kids', 'Romance', 'Sci-Fi', 'Thriller'],
+};
+const CATEGORY_ICONS = {
+  'Action': '💥', 'Adventure': '🗺️', 'Animation': '🎨', 'Anime': '⛩️', 'Comedy': '😂',
+  'Crime': '🔫', 'Documentary': '📽️', 'Drama': '🎭', 'Family': '👨‍👩‍👧', 'Fantasy': '🐉',
+  'History': '🏛️', 'Horror': '👻', 'Kids': '🧸', 'Music': '🎵', 'Mystery': '🔍',
+  'Reality': '📺', 'Romance': '💕', 'Sci-Fi': '🚀', 'Sport': '⚽', 'Talk': '🎤',
+  'Thriller': '😱', 'TV Movie': '🎬', 'War': '⚔️', 'Western': '🤠',
+};
+
+async function loadCategoriesPage() {
+  const groups = [
+    { key: 'movie', title: '🎬 Movie Genres', type: 'movie' },
+    { key: 'tv', title: '📺 TV Show Genres', type: 'tv' },
+    { key: 'animation', title: '🎨 Animation Genres', type: 'animation' },
+  ];
+
+  let html = '<div class="categories-page"><h1 class="page-heading">🗂️ Categories</h1>';
+  for (const g of groups) {
+    const chips = (CATEGORY_GENRES[g.key] || []).map(name =>
+      `<button class="genre-chip" data-genre="${esc(name)}" data-type="${g.type}">
+        <span class="genre-chip-icon">${CATEGORY_ICONS[name] || '🎞️'}</span>
+        <span class="genre-chip-name">${esc(name)}</span>
+      </button>`
+    ).join('');
+    html += `<div class="genre-group">
+      <h2 class="genre-group-title">${g.title}</h2>
+      <div class="genre-chip-grid">${chips}</div>
+    </div>`;
+  }
+  html += '</div>';
+  contentArea.innerHTML = html;
+
+  document.querySelectorAll('.genre-chip').forEach(chip => {
+    chip.addEventListener('click', () => {
+      loadGenrePage(chip.dataset.genre, chip.dataset.type);
+    });
+  });
+}
+
+// --- Genre results page ---
+let genreState = { genre: '', type: 'movie', page: 1, loading: false, done: false };
+
+async function loadGenrePage(genre, type) {
+  genreState = { genre, type, page: 1, loading: false, done: false };
+  const icon = CATEGORY_ICONS[genre] || '🎞️';
+  const typeLabel = type === 'tv' ? 'TV Shows' : type === 'animation' ? 'Animation' : 'Movies';
+
+  contentArea.innerHTML = `<div class="movie-row">
+    <div class="detail-nav-row">
+      <button class="back-btn detail-back-btn" id="genreBackBtn">
+        <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg>
+        All Categories
+      </button>
+    </div>
+    <div class="row-header"><h2 class="row-title">${icon} ${esc(genre)} ${typeLabel}</h2></div>
+    <div class="movie-grid" id="genreGrid"></div>
+    <div class="mt-loading" id="genreLoading">Loading...</div>
+  </div>`;
+
+  const backBtn = document.getElementById('genreBackBtn');
+  if (backBtn) backBtn.addEventListener('click', () => loadCategoriesPage());
+
+  await loadMoreGenre();
+
+  window.__genreScrollHandler = async () => {
+    const el = document.getElementById('genreLoading');
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    if (rect.top < window.innerHeight + 300) await loadMoreGenre();
+  };
+  window.addEventListener('scroll', window.__genreScrollHandler, { passive: true });
+}
+
+async function loadMoreGenre() {
+  if (genreState.loading || genreState.done) return;
+  genreState.loading = true;
+
+  const grid = document.getElementById('genreGrid');
+  const loadEl = document.getElementById('genreLoading');
+  if (loadEl) loadEl.textContent = 'Loading more...';
+
+  try {
+    const data = await apiFetch(`/api/genre/${encodeURIComponent(genreState.genre)}?type=${genreState.type}&page=${genreState.page}`);
+    const items = (data.items || []).map(it => ({
+      id: it.subject_id, title: it.name || 'Untitled', poster: it.poster_url || '',
+      slug: it.slug, badge: it.badge || '', rating: it.rating || null,
+      source: 'moviebox', type: 'moviebox',
+    }));
+
+    if (!items.length) {
+      genreState.done = true;
+      if (loadEl) { loadEl.textContent = genreState.page === 1 ? `No ${genreState.genre} content found.` : 'You have reached the end.'; loadEl.classList.add('mt-end'); }
+      genreState.loading = false;
+      return;
+    }
+
+    if (grid) { grid.insertAdjacentHTML('beforeend', items.map(renderCard).join('')); attachCardListeners(); }
+    genreState.page += 1;
+    if (!data.has_more || genreState.page > 15) {
+      genreState.done = true;
+      if (loadEl) { loadEl.textContent = 'You have reached the end.'; loadEl.classList.add('mt-end'); }
+    }
+  } catch (e) {
+    genreState.done = true;
+    if (loadEl) { loadEl.textContent = 'Failed to load more.'; loadEl.classList.add('mt-end'); }
+  }
+  genreState.loading = false;
+}
+
 async function searchMovies(query) {
   showLoading();
   const data = await apiFetch(`/api/search?q=${encodeURIComponent(query)}`);
@@ -1503,6 +1683,30 @@ async function openDetail(source, type, id, slug) {
     };
 
     // Resources panel (season/episode)
+    // Audio track (dub) selector — upstream exposes dual-audio / Hindi-dubbed
+    // variants of a title as separate subjects in `detail.dubs`.
+    let dubSelectorHtml = '';
+    const dubList = (detail.dubs || []).filter(d => d && d.detailPath && d.subjectId && d.type !== 1);
+    const seenDubKeys = new Set();
+    const uniqueDubs = dubList.filter(d => {
+      const key = `${d.lanCode || ''}|${d.type}`;
+      if (seenDubKeys.has(key)) return false;
+      seenDubKeys.add(key);
+      return true;
+    });
+    if (uniqueDubs.length > 1) {
+      const currentSubjectId = String(detail.id || id || '');
+      const btns = uniqueDubs.map(d => {
+        const active = String(d.subjectId) === currentSubjectId || (!currentSubjectId && d.original);
+        return `<button class="season-tab dub-tab${active ? ' active' : ''}" data-dub-id="${esc(d.subjectId)}" data-dub-slug="${esc(d.detailPath)}">${esc(d.lanName || d.lanCode || 'Audio')}</button>`;
+      }).join('');
+      dubSelectorHtml = `
+        <div class="format-section">
+          <span class="format-title">Audio Track</span>
+        </div>
+        <div class="season-tabs dub-tabs" id="dubTabs">${btns}</div>`;
+    }
+
     let resourcesHtml = '';
     if (detail.type === 'tv') {
       const resource = detail.resource || {};
@@ -1538,6 +1742,7 @@ async function openDetail(source, type, id, slug) {
 
       resourcesHtml = `
         <div class="detail-resources">
+          ${dubSelectorHtml}
           <div class="format-section">
             <span class="format-title">Format</span>
             <span class="format-info">${esc(formatLabel)}</span>
@@ -1552,6 +1757,7 @@ async function openDetail(source, type, id, slug) {
       const sourceName = resource.source || 'MovieBox.ph';
       resourcesHtml = `
         <div class="detail-resources">
+          ${dubSelectorHtml}
           <div class="format-section">
             <span class="format-title">Format</span>
             <span class="format-info">${esc(formatLabel)}</span>
@@ -1671,6 +1877,19 @@ async function openDetail(source, type, id, slug) {
 
     // Bind season/episode buttons
     bindSeasonEpisodeButtons(source, type, id);
+
+    // Bind audio (dub) switcher — each dub is its own subject upstream,
+    // so switching reloads the detail page with the dub's subject/slug.
+    document.querySelectorAll('#dubTabs .dub-tab').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const dubId = btn.dataset.dubId;
+        const dubSlug = btn.dataset.dubSlug;
+        if (!dubId || !dubSlug || String(dubId) === String(id)) return;
+        stopCurrentTranscode();
+        const navType = (currentDetail && currentDetail.type === 'tv') ? 'tv' : 'movie';
+        openDetail('moviebox', navType, dubId, dubSlug);
+      });
+    });
     if (detail.type === 'tv') {
       setPlayingEpisode(1);
     }
