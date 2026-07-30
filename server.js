@@ -1073,7 +1073,7 @@ app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🎬 MovieBox running at http://localhost:${PORT}`);
   console.log(`📡 Moviebox-API: ${MOVIEBOX_API}`);
   console.log(`🔍 Search: MovieBox.ph (Hindi/Tamil/Telugu available)\n`);
