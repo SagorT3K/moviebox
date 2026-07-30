@@ -9,6 +9,77 @@ let searchTimeout = null;
 let currentDetail = null;
 let currentSection = null;
 
+// --- HEVC support detection (cached) ---
+// VIP-locked qualities are only served as HEVC (h265) DASH. Browsers without
+// HEVC decoding show a black screen with audio — detect support once here.
+function canPlayHEVC() {
+  if (window.__hevcSupport !== undefined) return window.__hevcSupport;
+  let ok = false;
+  const tests = [
+    'video/mp4; codecs="hev1.1.6.L120.90"',
+    'video/mp4; codecs="hvc1.1.6.L120.90"',
+    'video/mp4; codecs="hev1"',
+    'video/mp4; codecs="hvc1"',
+  ];
+  try {
+    if (window.MediaSource && MediaSource.isTypeSupported) {
+      ok = tests.some(t => MediaSource.isTypeSupported(t));
+    }
+    if (!ok) {
+      const v = document.createElement('video');
+      ok = tests.some(t => v.canPlayType(t) === 'probably' || v.canPlayType(t) === 'maybe');
+      // 'maybe' from a bare codec string is unreliable; require real support
+      ok = ok && tests.some(t => v.canPlayType(t) !== '');
+      if (ok && !tests.some(t => v.canPlayType(t) === 'probably') && !(window.MediaSource && tests.some(t => MediaSource.isTypeSupported(t)))) {
+        ok = false;
+      }
+    }
+  } catch (e) { ok = false; }
+  window.__hevcSupport = ok;
+  return ok;
+}
+
+// Stop any running server-side transcode session
+function stopCurrentTranscode() {
+  if (window.__transcodeId) {
+    try { fetch(`/api/transcode/${window.__transcodeId}/stop`); } catch (e) {}
+    window.__transcodeId = null;
+  }
+}
+
+// Rebuild the player with a different source, trying to keep playback position
+async function switchToSource(src, type) {
+  const resume = window.__artPlayer ? window.__artPlayer.currentTime : 0;
+  if (!src) return;
+  window.__currentStream.src = src;
+  window.__currentStream.type = type;
+  window.__pendingSeek = resume > 2 ? resume : 0;
+  initArtPlayer();
+}
+
+// Start a server-side HEVC->H.264 transcode for a requested height and play it
+async function playTranscodedQuality(height) {
+  const stream = window.__currentStream;
+  const art = window.__artPlayer;
+  if (!stream || !stream.dashUrl) return false;
+  if (art) art.notice.show = `Transcoding ${height}p (HEVC → H.264), please wait…`;
+  try {
+    const tc = await fetch(`/api/transcode/start?url=${encodeURIComponent(stream.dashUrl)}&height=${height}`).then(r => r.json());
+    if (tc && tc.playlist) {
+      stopCurrentTranscode();
+      window.__transcodeId = tc.id;
+      await switchToSource(tc.playlist, 'application/x-mpegURL');
+      const qualityLabel = document.getElementById('qualityLabel');
+      if (qualityLabel) qualityLabel.textContent = height + 'p';
+      return true;
+    }
+    if (art) art.notice.show = (tc && tc.error) || 'Transcode unavailable on this server';
+  } catch (e) {
+    if (art) art.notice.show = 'Transcode failed to start';
+  }
+  return false;
+}
+
 // --- Sidebar ---
 sidebarToggle.addEventListener('click', () => sidebar.classList.toggle('open'));
 document.addEventListener('click', (e) => {
@@ -29,21 +100,167 @@ document.querySelectorAll('.nav-item[data-page]').forEach(item => {
   });
 });
 
-// --- Search ---
+// --- HD-MovieBox logo click → back to home page ---
+(function bindLogoHome() {
+  const logo = document.querySelector('.sidebar-logo');
+  if (!logo) return;
+  logo.addEventListener('click', () => {
+    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+    const homeItem = document.querySelector('.nav-item[data-page="home"]');
+    if (homeItem) homeItem.classList.add('active');
+    currentPage = 'home';
+    currentSection = null;
+    sidebar.classList.remove('open');
+    stopCurrentTranscode();
+    destroyPlayers();
+    window.scrollTo({ top: 0 });
+    loadPage();
+  });
+})();
+
+// --- "Not available right now" toast for faded/disabled items ---
+function showSoonToast() {
+  let t = document.getElementById('soonToast');
+  if (!t) {
+    t = document.createElement('div');
+    t.id = 'soonToast';
+    t.className = 'soon-toast';
+    t.textContent = 'Not available right now';
+    document.body.appendChild(t);
+  }
+  t.classList.add('show');
+  clearTimeout(t.__hideTimer);
+  t.__hideTimer = setTimeout(() => t.classList.remove('show'), 1800);
+}
+
+document.querySelectorAll('.nav-disabled, .soon-faded').forEach(item => {
+  item.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    showSoonToast();
+  });
+});
+
+// --- Detail page back navigation ---
+// Snapshot the browse state before opening a detail page so "Back" returns
+// the user exactly where they were (home / section / search results).
+function destroyPlayers() {
+  if (window.__artPlayer) { try { window.__artPlayer.destroy(); } catch (e) {} window.__artPlayer = null; }
+  if (window.__dashPlayer) { try { window.__dashPlayer.reset(); } catch (e) {} window.__dashPlayer = null; }
+  if (window.__hlsPlayer) { try { window.__hlsPlayer.destroy(); } catch (e) {} window.__hlsPlayer = null; }
+}
+
+function captureBrowseState() {
+  // Only capture when NOT already inside a detail page
+  if (document.querySelector('.detail-page')) return;
+  const q = searchInput ? searchInput.value.trim() : '';
+  window.__browseState = {
+    page: currentPage,
+    section: currentSection,
+    query: q,
+    scrollY: window.scrollY || 0,
+  };
+}
+
+function detailBack() {
+  stopCurrentTranscode();
+  destroyPlayers();
+  const st = window.__browseState || { page: 'home', section: null, query: '' };
+  currentPage = st.page || 'home';
+  currentSection = st.section || null;
+  if (st.query) {
+    if (searchInput) searchInput.value = st.query;
+    searchMovies(st.query);
+  } else {
+    loadPage();
+  }
+  setTimeout(() => window.scrollTo({ top: st.scrollY || 0 }), 50);
+}
+
+// --- Search + Autocomplete ---
+let suggestTimeout = null;
+let activeSuggestIndex = -1;
+
+// Create suggestions dropdown
+const suggestDropdown = document.createElement('div');
+suggestDropdown.className = 'search-suggest';
+suggestDropdown.id = 'searchSuggest';
+searchInput.parentNode.style.position = 'relative';
+searchInput.parentNode.appendChild(suggestDropdown);
+
 searchInput.addEventListener('input', () => {
   clearTimeout(searchTimeout);
+  clearTimeout(suggestTimeout);
+  const q = searchInput.value.trim();
+  activeSuggestIndex = -1;
+
+  if (q.length === 0) {
+    suggestDropdown.classList.remove('show');
+    suggestDropdown.innerHTML = '';
+    currentSection = null;
+    loadPage();
+    return;
+  }
+
+  // Fetch suggestions after 200ms delay
+  suggestTimeout = setTimeout(async () => {
+    try {
+      const res = await fetch(`/api/search/suggest?q=${encodeURIComponent(q)}`);
+      const data = await res.json();
+      const suggestions = data.suggestions || [];
+      if (suggestions.length > 0 && document.activeElement === searchInput) {
+        suggestDropdown.innerHTML = suggestions.map((s, i) =>
+          `<div class="suggest-item" data-word="${esc(s.word)}" data-index="${i}">${esc(s.word)}</div>`
+        ).join('');
+        suggestDropdown.classList.add('show');
+        // Bind click on suggestions
+        suggestDropdown.querySelectorAll('.suggest-item').forEach(item => {
+          item.addEventListener('mousedown', (e) => {
+            e.preventDefault();
+            searchInput.value = item.dataset.word;
+            suggestDropdown.classList.remove('show');
+            searchMovies(item.dataset.word);
+          });
+        });
+      } else {
+        suggestDropdown.classList.remove('show');
+      }
+    } catch (err) { /* ignore */ }
+  }, 200);
+
+  // Also do full search after 400ms
   searchTimeout = setTimeout(() => {
-    const q = searchInput.value.trim();
     if (q.length >= 2) searchMovies(q);
-    else if (q.length === 0) { currentSection = null; loadPage(); }
   }, 400);
 });
 
 searchInput.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') {
+  const items = suggestDropdown.querySelectorAll('.suggest-item');
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    activeSuggestIndex = Math.min(activeSuggestIndex + 1, items.length - 1);
+    items.forEach((it, i) => it.classList.toggle('active', i === activeSuggestIndex));
+    if (items[activeSuggestIndex]) searchInput.value = items[activeSuggestIndex].dataset.word;
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    activeSuggestIndex = Math.max(activeSuggestIndex - 1, 0);
+    items.forEach((it, i) => it.classList.toggle('active', i === activeSuggestIndex));
+    if (items[activeSuggestIndex]) searchInput.value = items[activeSuggestIndex].dataset.word;
+  } else if (e.key === 'Enter') {
     clearTimeout(searchTimeout);
+    clearTimeout(suggestTimeout);
+    suggestDropdown.classList.remove('show');
     const q = searchInput.value.trim();
     if (q) searchMovies(q);
+  } else if (e.key === 'Escape') {
+    suggestDropdown.classList.remove('show');
+  }
+});
+
+// Close suggestions on outside click
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('.search-box')) {
+    suggestDropdown.classList.remove('show');
   }
 });
 
@@ -138,6 +355,8 @@ async function loadPage() {
   if (window.__sectionScrollHandler) { window.removeEventListener('scroll', window.__sectionScrollHandler); window.__sectionScrollHandler = null; }
   if (window.__mwScrollHandler) { window.removeEventListener('scroll', window.__mwScrollHandler); window.__mwScrollHandler = null; }
   if (window.__imdbScrollHandler) { window.removeEventListener('scroll', window.__imdbScrollHandler); window.__imdbScrollHandler = null; }
+  stopCurrentTranscode();
+  destroyPlayers();
 
   showLoading();
   contentArea.innerHTML = '';
@@ -169,53 +388,51 @@ async function loadHomePage() {
   const data = await apiFetch('/api/home');
   const sections = data.sections || [];
 
-  // Find a hero from the Banner section if present
-  const bannerSection = sections.find(s => /banner/i.test(s.title));
-  const hero = bannerSection && bannerSection.items.length > 0 ? bannerSection.items[0] : null;
-
   if (!sections.length) {
     contentArea.innerHTML = '<div class="no-results"><p>No content found</p></div>';
     return;
   }
 
-  // Build the hero slide list (Banner section items, fallback to first few sections)
-  const heroSlides = [];
-  if (bannerSection && bannerSection.items.length > 0) {
-    bannerSection.items.forEach(it => {
-      const img = it.backdrop || it.poster || '';
-      if (img) heroSlides.push(it);
-    });
-  }
-  // Fallback: collect a few slides from trending/sections if no Banner section
-  if (heroSlides.length === 0) {
-    for (const s of sections) {
-      for (const it of (s.items || [])) {
+  // Hero carousel — pull ONLY from the "Recently Released Movies" collection
+  // (movie-only feed with proper backdrops, year, genre and rating).
+  let heroSlides = [];
+  try {
+    const rec = await apiFetch('/api/recent-movies');
+    heroSlides = (rec.items || []).filter(it => it.type === 'movie' && it.backdrop);
+  } catch (e) { heroSlides = []; }
+
+  // Fallback only if the recent-movies feed is unavailable: use the Banner
+  // section so the hero never renders empty.
+  let heroRowTitle = null; // home section hidden from the rows because it's in the hero
+  if (!heroSlides.length) {
+    const banner = sections.find(s => /banner/i.test(s.title));
+    if (banner && banner.items.length) {
+      heroRowTitle = banner.title;
+      banner.items.forEach(it => {
         const img = it.backdrop || it.poster || '';
         if (img) heroSlides.push(it);
-        if (heroSlides.length >= 6) break;
-      }
-      if (heroSlides.length >= 6) break;
+      });
     }
   }
+  const hero = heroSlides.length > 0 ? heroSlides[0] : null;
 
   let html = '';
 
-  // Hero banner — auto-rotating slideshow
+  // Hero banner — auto-sliding carousel with arrows + dots
   if (heroSlides.length > 0) {
     const slidesHtml = heroSlides.map((it, i) => {
       const img = it.backdrop || it.poster || '';
-      const lang = mapLanguage(it.language || it.title || it.badge || '');
       const year = it.year || '';
+      const genre = it.genre || '';
       return `
-        <div class="hero-slide${i === 0 ? ' active' : ''}" data-source="${it.source || 'moviebox'}" data-type="${it.type || 'movie'}" data-id="${it.id || ''}" data-slug="${it.slug || ''}">
+        <div class="hero-slide${i === 0 ? ' active' : ''}" data-source="${it.source || 'tmdb'}" data-type="${it.type || 'movie'}" data-id="${it.id || ''}" data-slug="${it.slug || ''}">
           <img src="${img}" alt="${esc(it.title)}" class="hero-backdrop" loading="${i === 0 ? 'eager' : 'lazy'}">
           <div class="hero-overlay"></div>
           <div class="hero-content">
             <h2 class="hero-title">${esc(it.title)}</h2>
             <div class="hero-meta">
-              ${lang ? `<span class="hero-badge">${lang}</span>` : ''}
-              ${year ? `<span>${year}</span>` : ''}
-              ${it.badge ? `<span>${esc(it.badge)}</span>` : ''}
+              ${year ? `<span class="hero-year">${year}</span>` : ''}
+              ${genre ? `<span class="hero-genre">${esc(genre)}</span>` : ''}
               ${it.rating ? `<span class="hero-rating">⭐ ${it.rating}</span>` : ''}
             </div>
             <button class="hero-play-btn" data-action="play">
@@ -244,32 +461,33 @@ async function loadHomePage() {
       </div>`;
   }
 
-  // Render each real section as a horizontal row
+  // Render each real section as a horizontal row with overlay carousel arrows
   for (const section of sections) {
     const items = section.items || [];
     if (!items.length) continue;
 
-    // Skip the Banner section from being rendered again as a row (used as hero)
-    const isBanner = /banner/i.test(section.title);
-    if (isBanner && hero) continue;
+    // Skip the section that the hero fallback is showing (avoid duplicate row)
+    if (heroRowTitle && section.title === heroRowTitle && hero) continue;
 
-    const sectionKey = section.title.replace(/^[^\w]+|[^\w]+$/g, '').toLowerCase();
-    html += `<div class="movie-row">
+    const sectionKey = section.title.replace(/^[^\w+]+|[^\w+]+$/g, '').toLowerCase();
+    html += `<div class="movie-row" data-section="${esc(sectionKey)}" data-section-title="${esc(section.title)}" data-page="1">
       <div class="row-header">
         <h2 class="row-title">${esc(section.title)}</h2>
         <div class="row-header-right">
-          <a href="#" class="row-more" data-section="${esc(sectionKey)}" data-section-title="${esc(section.title)}">More ›</a>
-          <div class="row-nav">
-            <button class="row-arrow arrow-left" aria-label="Scroll left">
-              <svg viewBox="0 0 24 24" fill="currentColor"><path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg>
-            </button>
-            <button class="row-arrow arrow-right" aria-label="Scroll right">
-              <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8.59 16.59L10 18l6-6-6-6-1.41 1.41L13.17 12z"/></svg>
-            </button>
-          </div>
+          <a href="#" class="row-more" data-section="${esc(sectionKey)}" data-section-title="${esc(section.title)}">More
+            <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14"><path d="M8.59 16.59L10 18l6-6-6-6-1.41 1.41L13.17 12z"/></svg>
+          </a>
         </div>
       </div>
-      <div class="row-scroll">${items.map(renderCard).join('')}</div>
+      <div class="row-wrap">
+        <div class="row-scroll">${items.map(renderCard).join('')}</div>
+        <button class="row-arrow row-arrow-left" aria-label="Previous items">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg>
+        </button>
+        <button class="row-arrow row-arrow-right" aria-label="Next items">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8.59 16.59L10 18l6-6-6-6-1.41 1.41L13.17 12z"/></svg>
+        </button>
+      </div>
     </div>`;
   }
 
@@ -289,22 +507,24 @@ async function loadHomePage() {
       source: 'moviebox', type: 'moviebox',
     }));
     if (imdbItems.length) {
-      html += `<div class="movie-row">
+      html += `<div class="movie-row" data-feed="top-imdb" data-page="1">
         <div class="row-header">
           <h2 class="row-title">🏆 Top IMDB Rated</h2>
           <div class="row-header-right">
-            <a href="#" class="row-more" onclick="event.preventDefault(); currentPage='top-imdb'; currentSection=null; loadPage();">More ›</a>
-            <div class="row-nav">
-              <button class="row-arrow arrow-left" aria-label="Scroll left">
-                <svg viewBox="0 0 24 24" fill="currentColor"><path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg>
-              </button>
-              <button class="row-arrow arrow-right" aria-label="Scroll right">
-                <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8.59 16.59L10 18l6-6-6-6-1.41-1.41L13.17 12z"/></svg>
-              </button>
-            </div>
+            <a href="#" class="row-more" data-page="top-imdb">More
+              <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14"><path d="M8.59 16.59L10 18l6-6-6-6-1.41 1.41L13.17 12z"/></svg>
+            </a>
           </div>
         </div>
-        <div class="row-scroll">${imdbItems.map(renderCard).join('')}</div>
+        <div class="row-wrap">
+          <div class="row-scroll">${imdbItems.map(renderCard).join('')}</div>
+          <button class="row-arrow row-arrow-left" aria-label="Previous items">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg>
+          </button>
+          <button class="row-arrow row-arrow-right" aria-label="Next items">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8.59 16.59L10 18l6-6-6-6-1.41 1.41L13.17 12z"/></svg>
+          </button>
+        </div>
       </div>`;
     }
   } catch (e) { /* skip if unavailable */ }
@@ -330,6 +550,7 @@ function initHeroBanner() {
   // Respect user motion preference
   const prefersReduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
+  if (heroState.timer) clearInterval(heroState.timer);
   heroState = { timer: null, index: 0, slides, dots, paused: false };
 
   const show = (idx) => {
@@ -370,7 +591,8 @@ function initHeroBanner() {
 
   const start = () => {
     stop();
-    if (prefersReduced) return; // do not auto-start when user requests reduced motion
+    // Always auto-advance — the CSS reduced-motion media query already strips
+    // the animated transitions for users who prefer reduced motion.
     heroState.timer = setInterval(() => {
       if (!heroState.paused) next();
     }, 6000);
@@ -441,39 +663,113 @@ function initHeroBanner() {
   start();
 }
 
-// --- Carousel arrow navigation ---
+// --- Carousel arrow navigation (item-by-item, seamless row loading) ---
 function bindCarouselArrows() {
-  document.querySelectorAll('.movie-row').forEach(row => {
+  document.querySelectorAll('.movie-row[data-section], .movie-row[data-feed]').forEach(row => {
+    if (row.dataset.carouselInit) return;
+    row.dataset.carouselInit = '1';
+
     const scroll = row.querySelector('.row-scroll');
     if (!scroll) return;
-    const left = row.querySelector('.arrow-left');
-    const right = row.querySelector('.arrow-right');
+    const left = row.querySelector('.row-arrow-left');
+    const right = row.querySelector('.row-arrow-right');
+    if (!left || !right) return;
 
-    const updateArrows = () => {
-      if (!left || !right) return;
-      const maxScroll = Math.max(0, scroll.scrollWidth - scroll.clientWidth);
-      left.classList.toggle('disabled', scroll.scrollLeft <= 1);
-      right.classList.toggle('disabled', scroll.scrollLeft >= maxScroll - 1);
+    const state = {
+      page: parseInt(row.dataset.page) || 1,
+      loading: false,
+      done: false,
+      seen: new Set(),
+    };
+    scroll.querySelectorAll('.movie-card').forEach(c => { if (c.dataset.id) state.seen.add(c.dataset.id); });
+
+    const canLoadMore = () => !!row.dataset.sectionTitle || !!row.dataset.feed;
+
+    // Slide one item at a time (card width + gap)
+    const itemStep = () => {
+      const card = scroll.querySelector('.movie-card');
+      if (!card) return Math.round(scroll.clientWidth * 0.8);
+      const styles = getComputedStyle(scroll);
+      const gap = parseFloat(styles.gap || styles.columnGap) || 16;
+      return card.offsetWidth + gap;
     };
 
-    // rAF-throttled handler for scroll/resize
+    const updateArrows = () => {
+      const maxScroll = Math.max(0, scroll.scrollWidth - scroll.clientWidth);
+      // Left arrow: visible only after the first slide right
+      left.classList.toggle('hidden', scroll.scrollLeft <= 2);
+      // Right arrow: hidden only when truly nothing more to show
+      const atEnd = scroll.scrollLeft >= maxScroll - 2;
+      const noOverflow = scroll.scrollWidth <= scroll.clientWidth + 2;
+      right.classList.toggle('hidden', (atEnd && state.done) || (noOverflow && !canLoadMore()) || (noOverflow && state.done));
+    };
+
+    // Fetch and append the next page of items for this row (seamless)
+    async function loadMoreRow() {
+      if (state.loading || state.done || !canLoadMore()) return;
+      state.loading = true;
+      right.classList.add('loading');
+      try {
+        const nextPage = state.page + 1;
+        const url = row.dataset.feed === 'top-imdb'
+          ? `/api/top-imdb?page=${nextPage}`
+          : `/api/section?name=${encodeURIComponent(row.dataset.sectionTitle)}&page=${nextPage}&row=1`;
+        const data = await apiFetch(url);
+        const items = (data.items || []).map(it => ({
+          id: it.subject_id || it.id,
+          title: it.name || it.title || 'Untitled',
+          poster: it.poster_url || it.poster || '',
+          slug: it.slug,
+          badge: it.badge || '',
+          rating: it.rating || null,
+          source: 'moviebox',
+          type: 'moviebox',
+        }));
+        const fresh = items.filter(it => it.id && !state.seen.has(it.id));
+        fresh.forEach(it => state.seen.add(it.id));
+        if (fresh.length) {
+          scroll.insertAdjacentHTML('beforeend', fresh.map(renderCard).join(''));
+          attachCardListeners();
+          state.page = nextPage;
+          if (data.hasMore === false || !items.length) state.done = true;
+        } else {
+          state.done = true;
+        }
+      } catch (e) {
+        console.error('Row load-more failed:', e);
+      }
+      state.loading = false;
+      right.classList.remove('loading');
+      updateArrows();
+    }
+
+    right.addEventListener('click', async () => {
+      // Seamless: prefetch the next page when we're about to reach the end
+      const nearEnd = scroll.scrollLeft + scroll.clientWidth >= scroll.scrollWidth - itemStep() * 1.5;
+      if (nearEnd) await loadMoreRow();
+      scroll.scrollBy({ left: itemStep(), behavior: 'smooth' });
+      setTimeout(updateArrows, 450);
+    });
+
+    left.addEventListener('click', () => {
+      scroll.scrollBy({ left: -itemStep(), behavior: 'smooth' });
+      setTimeout(updateArrows, 450);
+    });
+
+    // rAF-throttled scroll/resize observer: updates arrows + seamless prefetch
     let rafId = null;
     const rafHandler = () => {
       if (rafId) return;
-      rafId = requestAnimationFrame(() => { updateArrows(); rafId = null; });
+      rafId = requestAnimationFrame(() => {
+        updateArrows();
+        const nearEnd = scroll.scrollLeft + scroll.clientWidth >= scroll.scrollWidth - itemStep() * 2;
+        if (nearEnd) loadMoreRow();
+        rafId = null;
+      });
     };
-
-    if (left) left.addEventListener('click', () => {
-      scroll.scrollBy({ left: -Math.round(scroll.clientWidth * 0.85), behavior: 'smooth' });
-    });
-    if (right) right.addEventListener('click', () => {
-      scroll.scrollBy({ left: Math.round(scroll.clientWidth * 0.85), behavior: 'smooth' });
-    });
-
     scroll.addEventListener('scroll', rafHandler, { passive: true });
     window.addEventListener('resize', rafHandler);
 
-    // Initial state
     updateArrows();
   });
 }
@@ -483,7 +779,44 @@ function bindSectionLinks() {
   document.querySelectorAll('.row-more').forEach(link => {
     link.addEventListener('click', (e) => {
       e.preventDefault();
+      // If the link targets a page (e.g. Top IMDB), switch to that page
+      if (link.dataset.page) {
+        currentPage = link.dataset.page;
+        currentSection = null;
+        // Update sidebar active state
+        document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+        const navItem = document.querySelector(`.nav-item[data-page="${link.dataset.page}"]`);
+        if (navItem) navItem.classList.add('active');
+        window.scrollTo({ top: 0 });
+        loadPage();
+        return;
+      }
+      // Otherwise open the section "See More" page
       currentSection = link.dataset.section;
+      window.scrollTo({ top: 0 });
+      loadPage();
+    });
+  });
+
+  // "See More" cards at the end of each row
+  document.querySelectorAll('.see-more-card').forEach(card => {
+    card.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      // If the card targets a page (e.g. Top IMDB), switch to that page
+      if (card.dataset.page) {
+        currentPage = card.dataset.page;
+        currentSection = null;
+        // Update sidebar active state
+        document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+        const navItem = document.querySelector(`.nav-item[data-page="${card.dataset.page}"]`);
+        if (navItem) navItem.classList.add('active');
+        window.scrollTo({ top: 0 });
+        loadPage();
+        return;
+      }
+      // Otherwise open the section "See More" page
+      currentSection = card.dataset.section;
       window.scrollTo({ top: 0 });
       loadPage();
     });
@@ -618,14 +951,27 @@ function goHome() {
 }
 
 function initSectionMore() {
-  const loading = document.getElementById('sectionLoading');
-  const sentinel = loading;
+  const sentinel = document.getElementById('sectionLoading');
   if (!sentinel) return;
-  window.__sectionScrollHandler = async () => {
+  let autoPulls = 0;
+  const maybeLoad = async () => {
+    if (sectionState.loading || sectionState.done) return;
     const rect = sentinel.getBoundingClientRect();
-    if (rect.top < window.innerHeight + 400) await loadMoreSection();
+    if (rect.top < window.innerHeight + 400) {
+      await loadMoreSection();
+      // If the page still doesn't overflow, keep pulling (up to 4 pages) so
+      // short first pages fill the screen without requiring a scroll gesture.
+      if (!sectionState.done && autoPulls < 4) {
+        autoPulls++;
+        const r2 = document.getElementById('sectionLoading')?.getBoundingClientRect();
+        if (r2 && r2.top < window.innerHeight + 400) setTimeout(maybeLoad, 250);
+      }
+    }
   };
+  window.__sectionScrollHandler = maybeLoad;
   window.addEventListener('scroll', window.__sectionScrollHandler, { passive: true });
+  // Kick off immediately in case the grid is already shorter than the viewport
+  setTimeout(maybeLoad, 250);
 }
 
 async function loadMoreSection() {
@@ -668,23 +1014,25 @@ async function loadCategoryPage(category, title, endpoint) {
   let html = '';
   for (const section of sections) {
     if (!section.items || !section.items.length) continue;
-    const sectionKey = section.title.replace(/^[^\w]+|[^\w]+$/g, '').toLowerCase();
-    html += `<div class="movie-row">
+    const sectionKey = section.title.replace(/^[^\w+]+|[^\w+]+$/g, '').toLowerCase();
+    html += `<div class="movie-row" data-section="${esc(sectionKey)}" data-section-title="${esc(section.title)}" data-page="1">
       <div class="row-header">
         <h2 class="row-title">${esc(section.title)}</h2>
         <div class="row-header-right">
-          <a href="#" class="row-more" data-section="${esc(sectionKey)}" data-section-title="${esc(section.title)}">More ›</a>
-          <div class="row-nav">
-            <button class="row-arrow arrow-left" aria-label="Scroll left">
-              <svg viewBox="0 0 24 24" fill="currentColor"><path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg>
-            </button>
-            <button class="row-arrow arrow-right" aria-label="Scroll right">
-              <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8.59 16.59L10 18l6-6-6-6-1.41-1.41L13.17 12z"/></svg>
-            </button>
-          </div>
+          <a href="#" class="row-more" data-section="${esc(sectionKey)}" data-section-title="${esc(section.title)}">More
+            <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14"><path d="M8.59 16.59L10 18l6-6-6-6-1.41 1.41L13.17 12z"/></svg>
+          </a>
         </div>
       </div>
-      <div class="row-scroll">${section.items.map(renderCard).join('')}</div>
+      <div class="row-wrap">
+        <div class="row-scroll">${section.items.map(renderCard).join('')}</div>
+        <button class="row-arrow row-arrow-left" aria-label="Previous items">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg>
+        </button>
+        <button class="row-arrow row-arrow-right" aria-label="Next items">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8.59 16.59L10 18l6-6-6-6-1.41 1.41L13.17 12z"/></svg>
+        </button>
+      </div>
     </div>`;
   }
 
@@ -832,19 +1180,20 @@ function renderCard(movie) {
     : `<div class="no-poster"><svg viewBox="0 0 24 24" fill="currentColor" width="32" height="32"><path d="M18 4l2 4h-3l-2-4h-2l2 4h-3l-2-4H8l2 4H7L5 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V4h-4z"/></svg></div>`;
 
   // Determine language (prefer explicit movie.language) and quality
-  const lang = mapLanguage(movie.language || movie.title || movie.badge || '');
+  const lang = mapLanguage(movie.language || movie.badge || movie.title || '');
   const badge = movie.badge || '';
   const quality = extractQuality(badge) || extractQuality(movie.title);
+  const rating = movie.rating || '';
 
-  // Clean title (remove [Hindi], [CAM], etc.)
-  const cleanTitle = (movie.title || '').replace(/\[.*?\]/g, '').trim();
+  // Keep full title with [Hindi] etc. — do NOT strip language tags
+  const displayTitle = (movie.title || '').trim();
 
-  // Build badge HTML
+  // Build badge HTML — show language badge from API (corner) or extracted language
   let badgeHtml = '';
-  if (lang) {
+  if (badge) {
+    badgeHtml = `<span class="card-lang">${esc(badge)}</span>`;
+  } else if (lang) {
     badgeHtml = `<span class="card-lang">${lang}</span>`;
-  } else if (badge) {
-    badgeHtml = `<span class="card-badge">${badge}</span>`;
   }
 
   return `
@@ -853,21 +1202,110 @@ function renderCard(movie) {
         ${poster}
         ${badgeHtml}
         ${quality ? `<span class="card-quality">${quality}</span>` : ''}
+        ${rating ? `<span class="card-rating">⭐ ${esc(rating)}</span>` : ''}
         <div class="card-play-overlay">
           <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
         </div>
+        <button class="card-download-btn" data-action="download" title="Download">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+        </button>
       </div>
       <div class="card-info">
-        <div class="card-title" title="${esc(cleanTitle)}">${esc(cleanTitle)}</div>
-        <div class="card-meta">${movie.year || ''}${movie.rating ? ' · ⭐ ' + movie.rating : ''}</div>
+        <div class="card-title" title="${esc(displayTitle)}">${esc(displayTitle)}</div>
+        <div class="card-meta">${movie.year || ''}${rating ? ' · ⭐ ' + rating : ''}</div>
       </div>
     </div>`;
 }
 
 function attachCardListeners() {
   document.querySelectorAll('.movie-card').forEach(card => {
-    card.onclick = () => openDetail(card.dataset.source, card.dataset.type, card.dataset.id, card.dataset.slug);
+    card.onclick = (e) => {
+      // Don't open detail if download button was clicked
+      if (e.target.closest('[data-action="download"]')) return;
+      openDetail(card.dataset.source, card.dataset.type, card.dataset.id, card.dataset.slug);
+    };
   });
+
+  // Download buttons on cards
+  document.querySelectorAll('.card-download-btn').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const card = btn.closest('.movie-card');
+      if (!card) return;
+      const source = card.dataset.source;
+      const id = card.dataset.id;
+      const slug = card.dataset.slug;
+      if (source !== 'moviebox' || !id || !slug) {
+        alert('Download available for MovieBox content only.');
+        return;
+      }
+      await triggerCardDownload(id, slug, btn);
+    });
+  });
+}
+
+// --- Card download handler ---
+async function triggerCardDownload(subjectId, slug, btn) {
+  const originalHtml = btn.innerHTML;
+  btn.innerHTML = `<svg viewBox="0 0 24 24" fill="currentColor" class="spin"><path d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46C19.54 15.03 20 13.57 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74C4.46 8.97 4 10.43 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z"/></svg>`;
+  btn.disabled = true;
+
+  try {
+    // Determine if TV show from card data
+    const card = document.querySelector(`.movie-card[data-id="${subjectId}"]`);
+    const type = card ? card.dataset.type : 'moviebox';
+    const isTv = type === 'tv';
+    const se = isTv ? 1 : 0;
+    const ep = isTv ? 1 : 0;
+
+    const res = await fetch(`/api/stream?subject_id=${subjectId}&slug=${encodeURIComponent(slug)}&se=${se}&ep=${ep}`);
+    const data = await res.json();
+
+    // Collect downloadable MP4 sources (DASH needs special handling, prefer MP4)
+    const mp4Sources = (data.sources || [])
+      .filter(s => s.url && s.url.length > 0)
+      .map(s => ({
+        url: s.url,
+        label: s.resolution || s.resolutions || '?p',
+        type: 'mp4',
+        size: s.size || '',
+        height: parseInt(s.resolutions) || parseInt(s.resolution) || 0,
+      }));
+
+    if (mp4Sources.length === 0) {
+      // No MP4 with URL — try DASH as fallback
+      const dashSources = (data.dash || []).filter(d => d.url && d.url.length > 0);
+      if (dashSources.length > 0) {
+        // Open DASH URL in new tab (user can use browser extension to download)
+        window.open(dashSources[0].url, '_blank');
+        alert('DASH stream opened in new tab. Use a browser DASH downloader extension to save the video.');
+      } else {
+        alert('No downloadable source found for this content.');
+      }
+      return;
+    }
+
+    // Pick the best MP4 quality (highest resolution)
+    mp4Sources.sort((a, b) => b.height - a.height);
+    const best = mp4Sources[0];
+    const title = (card ? card.querySelector('.card-title') : null)?.textContent || 'download';
+    const proxyUrl = `/api/download?url=${encodeURIComponent(best.url)}&title=${encodeURIComponent(title)}`;
+
+    // Use hidden anchor to trigger download
+    const a = document.createElement('a');
+    a.href = proxyUrl;
+    a.download = '';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  } catch (err) {
+    console.error('Download failed:', err);
+    alert('Download failed. Please try again.');
+  } finally {
+    btn.innerHTML = originalHtml;
+    btn.disabled = false;
+  }
 }
 
 // --- Embed sources ---
@@ -892,6 +1330,8 @@ function getEmbedServers(type, id, se, ep) {
 // --- Detail page ---
 async function openDetail(source, type, id, slug) {
   showLoading();
+  stopCurrentTranscode();
+  captureBrowseState();
   contentArea.innerHTML = '';
 
   try {
@@ -928,39 +1368,64 @@ async function openDetail(source, type, id, slug) {
     const validDASH = (streamData && streamData.dash || []).filter(d => d.url && d.url.length > 0);
     const validHLS = (streamData && streamData.hls || []).filter(h => h.url && h.url.length > 0);
 
+    // VIP-locked MP4 resolutions come back with empty URLs, but the DASH
+    // stream still carries every resolution. Detect the DASH codec (HEVC vs
+    // H.264) and the browser's HEVC support to decide how to unlock them.
+    const dashEntry = validDASH[0] || null;
+    let dashCodec = String(dashEntry ? (dashEntry.codecName || dashEntry.codec || dashEntry.format || '') : '').toLowerCase();
+    const hevcOK = canPlayHEVC();
+
+    let dashRes = [];
+    if (dashEntry) {
+      try {
+        const manifestData = await fetch(`/api/dash-manifest?url=${encodeURIComponent(dashEntry.url)}`).then(r => r.json());
+        window.__dashManifest = manifestData;
+        if (manifestData.resolutions && manifestData.resolutions.length > 0) dashRes = manifestData.resolutions;
+        if (!dashCodec && manifestData.codec) dashCodec = String(manifestData.codec).toLowerCase();
+      } catch (e) {}
+      if (dashRes.length === 0 && dashEntry.resolutions) {
+        dashRes = String(dashEntry.resolutions).split(',')
+          .map(h => parseInt(h)).filter(h => h > 0)
+          .map(h => ({ height: h, label: h + 'p' }));
+      }
+      dashRes.sort((a, b) => b.height - a.height);
+    }
+    const dashIsHevc = /hevc|h265|hev1|hvc1/.test(dashCodec);
+    const dashPlayable = !!(dashEntry && (!dashIsHevc || hevcOK));
+
+    // MP4 (H.264) qualities that are actually free (non-empty URL)
+    const mp4Qualities = validSources.map(s => {
+      const h = parseInt(s.resolutions) || parseInt(s.resolution) || 0;
+      return { height: h, label: (s.resolution || (h + 'p')), url: `/api/proxy?url=${encodeURIComponent(s.url)}`, kind: 'mp4' };
+    }).filter(q => q.height > 0).sort((a, b) => b.height - a.height);
+
     let playerSrc = '';
     let playerType = '';
     let formatLabel = 'Loading...';
     let isEmbed = false;
     let resolutions = [];
+    let qualityPlan = [];
 
-    if (validDASH.length > 0) {
-      playerSrc = validDASH[0].url;
+    if (dashPlayable) {
+      // Browser can decode this DASH — play it directly, ALL resolutions unlocked
+      playerSrc = dashEntry.url;
       playerType = 'application/dash+xml';
-      formatLabel = 'High efficiency (DASH/H.265)';
-
-      try {
-        const manifestData = await fetch(`/api/dash-manifest?url=${encodeURIComponent(playerSrc)}`).then(r => r.json());
-        window.__dashManifest = manifestData;
-        if (manifestData.resolutions && manifestData.resolutions.length > 0) {
-          resolutions = manifestData.resolutions;
-        }
-      } catch (e) {}
-    } else if (validSources.length > 0) {
-      playerSrc = `/api/proxy?url=${encodeURIComponent(validSources[0].url)}`;
+      formatLabel = dashIsHevc ? 'High efficiency (DASH/H.265)' : 'DASH Streaming';
+      resolutions = dashRes;
+      qualityPlan = dashRes.map(r => ({ height: r.height, label: r.label || r.height + 'p', kind: 'dash', url: '' }));
+    } else if (mp4Qualities.length > 0) {
+      // HEVC DASH not decodable here — default to best free H.264 MP4 so the
+      // screen is never black; locked qualities still offered via transcode
+      playerSrc = mp4Qualities[0].url;
       playerType = 'video/mp4';
       formatLabel = 'MP4 (H.264)';
-      const allMp4Sources = streamData.sources || [];
-      resolutions = allMp4Sources.map(s => ({
-        height: parseInt(s.resolutions) || parseInt(s.resolution) || 0,
-        label: s.resolution || s.resolutions + 'p',
-        url: s.url ? `/api/proxy?url=${encodeURIComponent(s.url)}` : '',
-      })).filter(r => r.height > 0).sort((a, b) => b.height - a.height);
-    } else if (validHLS.length > 0) {
+      resolutions = mp4Qualities.map(q => ({ height: q.height, label: q.label, url: q.url }));
+      qualityPlan = mp4Qualities.map(q => ({ ...q }));
+    } else if (validHLS.length > 0 && !dashEntry) {
       playerSrc = validHLS[0].url;
       playerType = 'application/x-mpegURL';
       formatLabel = 'HLS Streaming';
-    } else {
+    } else if (!dashEntry) {
       isEmbed = true;
       formatLabel = 'External Source';
       let tmdbId = null;
@@ -980,14 +1445,60 @@ async function openDetail(source, type, id, slug) {
       }
     }
 
+    // Merge qualities that only exist in the DASH (the VIP-locked ones) into
+    // the plan — everything becomes selectable, no VIP lock in the UI.
+    if (dashEntry && dashRes.length) {
+      for (const r of dashRes) {
+        const h = parseInt(r.height) || 0;
+        if (!h) continue;
+        if (!qualityPlan.some(q => q.height === h)) {
+          qualityPlan.push({
+            height: h,
+            label: r.label || h + 'p',
+            kind: dashPlayable ? 'dash' : 'hls',
+            url: '',
+          });
+        }
+      }
+    }
+    // Merge free MP4-only qualities (e.g. 360p) that the DASH doesn't carry
+    if (dashPlayable) {
+      for (const q of mp4Qualities) {
+        if (!qualityPlan.some(p => p.height === q.height)) qualityPlan.push({ ...q });
+      }
+    }
+    qualityPlan.sort((a, b) => b.height - a.height);
+
+    // If neither DASH nor MP4 is directly playable but a DASH exists,
+    // transcode the top quality via FFmpeg (HEVC → H.264 HLS)
+    if (!playerSrc && !isEmbed && dashEntry && qualityPlan.length) {
+      const top = qualityPlan[0];
+      formatLabel = 'Transcoding (HEVC → H.264)';
+      try {
+        const tc = await fetch(`/api/transcode/start?url=${encodeURIComponent(dashEntry.url)}&height=${top.height}`).then(r => r.json());
+        if (tc && tc.playlist) {
+          stopCurrentTranscode();
+          window.__transcodeId = tc.id;
+          top.kind = 'hls';
+          top.sessionId = tc.id;
+          playerSrc = tc.playlist;
+          playerType = 'application/x-mpegURL';
+        }
+      } catch (e) {}
+    }
+
     window.__currentStream = {
       src: playerSrc,
       type: playerType,
       mp4Sources: validSources,
-      dashUrl: validDASH.length > 0 ? validDASH[0].url : '',
+      dashUrl: dashEntry ? dashEntry.url : '',
       hlsUrl: validHLS.length > 0 ? validHLS[0].url : '',
       captionData: captionData,
       resolutions: resolutions,
+      qualityPlan: qualityPlan,
+      dashCodec: dashCodec,
+      dashIsHevc: dashIsHevc,
+      hevcOK: hevcOK,
       isEmbed: isEmbed,
     };
 
@@ -1072,8 +1583,54 @@ async function openDetail(source, type, id, slug) {
     const genres = (detail.genres || []).map(g => `<span>${esc(g)}</span>`).join(' / ');
     const cornerHtml = detail.corner ? `<span class="detail-badge">${detail.corner}</span>` : '';
 
+    // Build download resolution options from MP4 sources only (DASH can't be directly downloaded)
+    const mp4Sources = (streamData && streamData.sources || []).filter(s => s.url && s.url.length > 0);
+
+    const downloadOptions = mp4Sources.map(s => {
+      const res = s.resolution || s.resolutions || '?';
+      const label = res.includes('p') ? res : res + 'p';
+      return { label, url: s.url, size: s.size || '', type: 'mp4', height: parseInt(res) || 0 };
+    }).sort((a, b) => b.height - a.height);
+
+    // If no MP4 available but DASH exists, add a DASH fallback option
+    if (downloadOptions.length === 0) {
+      const dashSources = (streamData && streamData.dash || []).filter(d => d.url && d.url.length > 0);
+      if (dashSources.length > 0) {
+        const highestRes = (dashSources[0].resolutions || '1080').split(',')[0];
+        downloadOptions.push({
+          label: highestRes + 'p (DASH)',
+          url: dashSources[0].url,
+          size: dashSources[0].size || '',
+          type: 'dash',
+          height: parseInt(highestRes) || 1080,
+        });
+      }
+    }
+
+    let downloadHtml = '';
+    if (downloadOptions.length > 0 && source === 'moviebox') {
+      const dlItems = downloadOptions.map((opt, i) => {
+        const sizeStr = opt.size ? ` (${opt.size})` : '';
+        return `<button class="dl-option" data-url="${esc(opt.url)}" data-title="${esc(detail.title || '')}">${opt.label}${sizeStr}</button>`;
+      }).join('');
+      downloadHtml = `
+        <div class="download-section">
+          <button class="download-btn-detail" id="downloadBtn">
+            <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+            Download
+          </button>
+          <div class="download-dropdown" id="downloadDropdown">${dlItems}</div>
+        </div>`;
+    }
+
     contentArea.innerHTML = `
       <div class="detail-page">
+        <div class="detail-nav-row">
+          <button class="back-btn detail-back-btn" onclick="detailBack()">
+            <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg>
+            Back
+          </button>
+        </div>
         <div class="detail-top">
           <div class="detail-player-wrap">
             <div class="player-wrap">
@@ -1087,6 +1644,7 @@ async function openDetail(source, type, id, slug) {
         <div class="detail-info">
           <div class="detail-title-row">
             <h1>${esc(detail.title || 'Untitled')}</h1>
+            ${downloadHtml}
           </div>
           <div class="detail-meta">
             ${cornerHtml}
@@ -1115,6 +1673,33 @@ async function openDetail(source, type, id, slug) {
     bindSeasonEpisodeButtons(source, type, id);
     if (detail.type === 'tv') {
       setPlayingEpisode(1);
+    }
+
+    // Bind download button + dropdown
+    const dlBtn = document.getElementById('downloadBtn');
+    const dlDropdown = document.getElementById('downloadDropdown');
+    if (dlBtn && dlDropdown) {
+      dlBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        dlDropdown.classList.toggle('show');
+      });
+      dlDropdown.querySelectorAll('.dl-option').forEach(opt => {
+        opt.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const url = opt.dataset.url;
+          const title = opt.dataset.title || 'download';
+          if (!url) return;
+          const a = document.createElement('a');
+          a.href = `/api/download?url=${encodeURIComponent(url)}&title=${encodeURIComponent(title)}`;
+          a.download = '';
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          dlDropdown.classList.remove('show');
+        });
+      });
+      // Close dropdown when clicking outside
+      document.addEventListener('click', () => dlDropdown.classList.remove('show'));
     }
 
     hideLoading();
@@ -1175,6 +1760,10 @@ function initArtPlayer() {
     try { window.__dashPlayer.reset(); } catch (e) {}
     window.__dashPlayer = null;
   }
+  if (window.__hlsPlayer) {
+    try { window.__hlsPlayer.destroy(); } catch (e) {}
+    window.__hlsPlayer = null;
+  }
 
   const container = document.getElementById('artplayer-app');
   if (!container) return;
@@ -1182,6 +1771,7 @@ function initArtPlayer() {
   const src = stream.src;
   const type = stream.type || 'video/mp4';
   const isDASH = type === 'application/dash+xml';
+  const isHLS = type === 'application/x-mpegURL';
   const resolutions = stream.resolutions || [];
 
   const qualityList = resolutions.map(r => ({
@@ -1224,6 +1814,20 @@ function initArtPlayer() {
     settings: [],
     controls: [],
   };
+
+  // HLS playback through hls.js (native HLS fallback for Safari)
+  if (isHLS && typeof Hls !== 'undefined' && Hls.isSupported()) {
+    artOptions.customType = {
+      m3u8: function(video, url, art) {
+        if (window.__hlsPlayer) { try { window.__hlsPlayer.destroy(); } catch (e) {} }
+        const hls = new Hls({ maxBufferLength: 30, enableWorker: true });
+        hls.loadSource(url);
+        hls.attachMedia(video);
+        window.__hlsPlayer = hls;
+        art.hls = hls;
+      },
+    };
+  }
 
   if (stream.captionData && stream.captionData.captions && stream.captionData.captions.length > 0) {
     const firstCap = stream.captionData.captions[0];
@@ -1269,6 +1873,15 @@ function initArtPlayer() {
         if (bitrateList && bitrateList.length > 0) {
           window.__dashBitrates = bitrateList;
           updateQualityControl(bitrateList);
+          // Apply a quality requested before the player finished initializing
+          if (window.__pendingDashHeight) {
+            const target = window.__pendingDashHeight;
+            window.__pendingDashHeight = null;
+            dashPlayer.updateSettings({ streaming: { abr: { autoSwitchBitrate: { video: false } } } });
+            for (const b of bitrateList) {
+              if (b.height === target) { dashPlayer.setQualityFor('video', b.qualityIndex); break; }
+            }
+          }
         }
       });
 
@@ -1295,6 +1908,10 @@ function initArtPlayer() {
 
   art.on('ready', () => {
     console.log('ArtPlayer ready');
+    if (window.__pendingSeek && window.__pendingSeek > 0) {
+      try { art.currentTime = window.__pendingSeek; } catch (e) {}
+      window.__pendingSeek = 0;
+    }
   });
 }
 
@@ -1417,10 +2034,22 @@ function addPlayerControls(art, stream) {
     }
 
     let qualityOptions = [];
-    if (isDASH && window.__dashBitrates && window.__dashBitrates.length > 0) {
+    const plan = (window.__currentStream && window.__currentStream.qualityPlan) || [];
+    if (plan.length > 0) {
+      // Unified plan: mp4 (direct), dash (native decode), hls (FFmpeg transcode)
+      qualityOptions = plan.map(q => ({
+        label: q.label || q.height + 'p',
+        height: q.height,
+        url: q.url || '',
+        kind: q.kind || 'mp4',
+        auto: false,
+        available: true,
+      }));
+    } else if (isDASH && window.__dashBitrates && window.__dashBitrates.length > 0) {
       qualityOptions = window.__dashBitrates.map(b => ({
         label: b.height + 'p',
         height: b.height,
+        kind: 'dash',
         auto: false,
         available: true,
       }));
@@ -1429,19 +2058,26 @@ function addPlayerControls(art, stream) {
         label: r.label || r.height + 'p',
         height: r.height,
         url: r.url || '',
+        kind: r.url ? 'mp4' : 'hls',
         auto: false,
-        available: !!(r.url && r.url.length > 0),
+        available: true,
       }));
     }
-    qualityOptions.push({ label: 'Auto', height: 0, auto: true, available: true });
+    qualityOptions.push({ label: 'Auto', height: 0, auto: true, available: true, kind: 'auto' });
+
+    // Mark the item matching the currently playing source as active
+    const curType = (window.__currentStream && window.__currentStream.type) || '';
+    const curKind = curType === 'application/dash+xml' ? 'dash' : curType === 'application/x-mpegURL' ? 'hls' : 'mp4';
+    const curSrc = (window.__currentStream && window.__currentStream.src) || '';
+    let activeIdx = qualityOptions.findIndex(q => q.kind === curKind && (curKind !== 'mp4' || q.url === curSrc));
+    if (activeIdx < 0) activeIdx = qualityOptions.findIndex(q => q.kind === curKind);
+    if (activeIdx < 0) activeIdx = 0;
 
     dropdowns.innerHTML += `
       <div class="player-dropdown" id="qualityDropdown">
         ${qualityOptions.map((q, i) => {
-          const disabledClass = q.available === false ? ' sub-unavailable' : '';
-          const activeClass = i === 0 ? ' active' : '';
-          const vipTag = q.available === false ? ' <span class="vip-tag">VIP</span>' : '';
-          return `<div class="player-dropdown-item${activeClass}${disabledClass}" data-qheight="${q.height}" data-qauto="${q.auto}" data-qurl="${q.url || ''}" data-qavailable="${q.available}">${q.label}${vipTag}</div>`;
+          const activeClass = i === activeIdx ? ' active' : '';
+          return `<div class="player-dropdown-item${activeClass}" data-qheight="${q.height}" data-qauto="${q.auto}" data-qurl="${q.url || ''}" data-qkind="${q.kind || ''}" data-qavailable="true">${q.label}</div>`;
         }).join('')}
       </div>`;
 
@@ -1483,7 +2119,7 @@ function addPlayerControls(art, stream) {
     playerEl.appendChild(dropdowns);
 
     dropdowns.querySelectorAll('.player-dropdown-item').forEach(item => {
-      item.addEventListener('click', (e) => {
+      item.addEventListener('click', async (e) => {
         e.stopPropagation();
         const dd = item.closest('.player-dropdown');
 
@@ -1530,14 +2166,6 @@ function addPlayerControls(art, stream) {
         }
 
         if (dd.id === 'qualityDropdown') {
-          const qAvailable = item.dataset.qavailable;
-
-          if (qAvailable === 'false') {
-            art.notice.show = 'This quality requires VIP access';
-            dd.classList.remove('show');
-            return;
-          }
-
           const qualityLabel = document.getElementById('qualityLabel');
           const cleanText = item.textContent.replace('VIP', '').trim();
           if (qualityLabel) qualityLabel.textContent = cleanText;
@@ -1545,14 +2173,44 @@ function addPlayerControls(art, stream) {
           const qHeight = parseInt(item.dataset.qheight);
           const qAuto = item.dataset.qauto === 'true';
           const qUrl = item.dataset.qurl;
+          const qKind = item.dataset.qkind || '';
+          const curStream = window.__currentStream || {};
+          const curType = curStream.type || '';
 
-          if (isDASH && window.__dashPlayer) {
-            if (qAuto) {
+          if (qAuto) {
+            if (window.__dashPlayer) {
               window.__dashPlayer.updateSettings({
                 streaming: { abr: { autoSwitchBitrate: { video: true } } },
               });
               art.notice.show = 'Quality: Auto';
             } else {
+              // Auto for progressive/transcoded modes = highest available quality
+              const plan = curStream.qualityPlan || [];
+              const top = plan[0];
+              if (top) {
+                if (top.kind === 'mp4' && top.url) {
+                  if (curType === 'video/mp4') art.switchUrl(top.url);
+                  else { stopCurrentTranscode(); await switchToSource(top.url, 'video/mp4'); }
+                } else if (top.kind === 'dash') {
+                  if (!window.__dashPlayer && curStream.dashUrl) {
+                    await switchToSource(curStream.dashUrl, 'application/dash+xml');
+                  }
+                } else if (top.kind === 'hls') {
+                  await playTranscodedQuality(top.height);
+                }
+              }
+              art.notice.show = 'Quality: Auto (highest)';
+            }
+          } else if (qKind === 'mp4' && qUrl) {
+            if (curType === 'video/mp4') {
+              art.switchUrl(qUrl);
+            } else {
+              stopCurrentTranscode();
+              await switchToSource(qUrl, 'video/mp4');
+            }
+            art.notice.show = `Quality: ${cleanText}`;
+          } else if (qKind === 'dash') {
+            if (window.__dashPlayer && curType === 'application/dash+xml') {
               window.__dashPlayer.updateSettings({
                 streaming: { abr: { autoSwitchBitrate: { video: false } } },
               });
@@ -1561,15 +2219,22 @@ function addPlayerControls(art, stream) {
                 for (let i = 0; i < bitrates.length; i++) {
                   if (bitrates[i].height === qHeight) {
                     window.__dashPlayer.setQualityFor('video', bitrates[i].qualityIndex);
-                    art.notice.show = `Quality: ${qHeight}p`;
                     break;
                   }
                 }
               }
+              art.notice.show = `Quality: ${qHeight}p`;
+            } else if (curStream.dashUrl) {
+              window.__pendingDashHeight = qHeight;
+              stopCurrentTranscode();
+              await switchToSource(curStream.dashUrl, 'application/dash+xml');
+              art.notice.show = `Quality: ${qHeight}p`;
             }
+          } else if (qKind === 'hls') {
+            await playTranscodedQuality(qHeight);
           } else if (qUrl) {
             art.switchUrl(qUrl);
-            art.notice.show = `Quality: ${item.textContent}`;
+            art.notice.show = `Quality: ${cleanText}`;
           }
         }
 
@@ -1594,12 +2259,17 @@ function updateQualityControl(bitrates) {
   const qualityDropdown = document.getElementById('qualityDropdown');
   if (!qualityLabel || !qualityDropdown) return;
 
-  const items = bitrates.map(b => `<div class="player-dropdown-item" data-qheight="${b.height}" data-qauto="false">${b.height}p</div>`).join('');
-  const autoItem = `<div class="player-dropdown-item active" data-qheight="0" data-qauto="true">Auto</div>`;
-  qualityDropdown.innerHTML = items + autoItem;
+  const dashHeights = bitrates.map(b => b.height);
+  const items = bitrates.map(b => `<div class="player-dropdown-item" data-qheight="${b.height}" data-qauto="false" data-qkind="dash">${b.height}p</div>`).join('');
+  // Merge free MP4-only qualities (e.g. 360p) that DASH doesn't carry
+  const plan = (window.__currentStream && window.__currentStream.qualityPlan) || [];
+  const mp4Only = plan.filter(q => q.kind === 'mp4' && q.url && !dashHeights.includes(q.height));
+  const mp4Items = mp4Only.map(q => `<div class="player-dropdown-item" data-qheight="${q.height}" data-qauto="false" data-qkind="mp4" data-qurl="${q.url}">${q.label}</div>`).join('');
+  const autoItem = `<div class="player-dropdown-item active" data-qheight="0" data-qauto="true" data-qkind="dash">Auto</div>`;
+  qualityDropdown.innerHTML = items + mp4Items + autoItem;
 
   qualityDropdown.querySelectorAll('.player-dropdown-item').forEach(item => {
-    item.addEventListener('click', (e) => {
+    item.addEventListener('click', async (e) => {
       e.stopPropagation();
       qualityDropdown.querySelectorAll('.player-dropdown-item').forEach(i => i.classList.remove('active'));
       item.classList.add('active');
@@ -1607,6 +2277,16 @@ function updateQualityControl(bitrates) {
 
       const qHeight = parseInt(item.dataset.qheight);
       const qAuto = item.dataset.qauto === 'true';
+      const qKind = item.dataset.qkind || 'dash';
+      const qUrl = item.dataset.qurl;
+
+      // Switch to a direct MP4 source (leave DASH mode)
+      if (qKind === 'mp4' && qUrl) {
+        stopCurrentTranscode();
+        await switchToSource(qUrl, 'video/mp4');
+        qualityDropdown.classList.remove('show');
+        return;
+      }
 
       if (window.__dashPlayer) {
         if (qAuto) {
@@ -1678,46 +2358,87 @@ function loadEpisode(btn, source, id, getSeason, setEp) {
   if (source === 'moviebox' && currentDetail?.slug && id) {
     const season = getSeason();
     const slug = currentDetail.slug;
+    stopCurrentTranscode();
 
     Promise.all([
       fetch(`/api/stream?subject_id=${id}&slug=${encodeURIComponent(slug)}&se=${season}&ep=${ep}`).then(r => r.json()),
       fetch(`/api/stream/${id}/captions?detail_path=${encodeURIComponent(slug)}&se=${season}&ep=${ep}`).then(r => r.json()).catch(() => null)
-    ]).then(([streamData, captionData]) => {
+    ]).then(async ([streamData, captionData]) => {
       const validSources = (streamData.sources || []).filter(s => s.url && s.url.length > 0);
       const validDASH = (streamData.dash || []).filter(d => d.url && d.url.length > 0);
       const validHLS = (streamData.hls || []).filter(h => h.url && h.url.length > 0);
 
+      const dashEntry = validDASH[0] || null;
+      const dashCodec = String(dashEntry ? (dashEntry.codecName || dashEntry.codec || dashEntry.format || '') : '').toLowerCase();
+      const dashIsHevc = /hevc|h265|hev1|hvc1/.test(dashCodec);
+      const dashPlayable = !!(dashEntry && (!dashIsHevc || canPlayHEVC()));
+
+      const mp4Qualities = validSources.map(s => {
+        const h = parseInt(s.resolutions) || parseInt(s.resolution) || 0;
+        return { height: h, label: (s.resolution || (h + 'p')), url: `/api/proxy?url=${encodeURIComponent(s.url)}`, kind: 'mp4' };
+      }).filter(q => q.height > 0).sort((a, b) => b.height - a.height);
+
       let newSrc = '';
       let newType = '';
       let isDASH = false;
+      let resolutions = [];
+      let qualityPlan = [];
 
-      if (validDASH.length > 0) {
-        newSrc = validDASH[0].url;
+      if (dashPlayable) {
+        newSrc = dashEntry.url;
         newType = 'application/dash+xml';
         isDASH = true;
-      } else if (validSources.length > 0) {
-        newSrc = `/api/proxy?url=${encodeURIComponent(validSources[0].url)}`;
+        resolutions = (window.__dashManifest?.resolutions || []);
+        qualityPlan = resolutions.map(r => ({ height: parseInt(r.height) || 0, label: r.label || r.height + 'p', kind: 'dash', url: '' }));
+      } else if (mp4Qualities.length > 0) {
+        newSrc = mp4Qualities[0].url;
         newType = 'video/mp4';
-      } else if (validHLS.length > 0) {
+        resolutions = mp4Qualities.map(q => ({ height: q.height, label: q.label, url: q.url }));
+        qualityPlan = mp4Qualities.map(q => ({ ...q }));
+      } else if (validHLS.length > 0 && !dashEntry) {
         newSrc = validHLS[0].url;
         newType = 'application/x-mpegURL';
       }
 
-      if (newSrc) {
-        const resolutions = isDASH ? (window.__dashManifest?.resolutions || []) : validSources.map(s => ({
-          height: parseInt(s.resolutions) || 0,
-          label: s.resolution || s.resolutions + 'p',
-          url: `/api/proxy?url=${encodeURIComponent(s.url)}`,
-        }));
+      // Unlock the DASH-only (VIP-locked) qualities in the episode plan
+      if (dashEntry && dashEntry.resolutions) {
+        const hs = String(dashEntry.resolutions).split(',').map(h => parseInt(h)).filter(h => h > 0);
+        for (const h of hs) {
+          if (!qualityPlan.some(q => q.height === h)) {
+            qualityPlan.push({ height: h, label: h + 'p', kind: dashPlayable ? 'dash' : 'hls', url: '' });
+          }
+        }
+        qualityPlan.sort((a, b) => b.height - a.height);
+      }
 
+      // Nothing directly playable → transcode top quality
+      if (!newSrc && dashEntry && qualityPlan.length) {
+        const top = qualityPlan[0];
+        try {
+          const tc = await fetch(`/api/transcode/start?url=${encodeURIComponent(dashEntry.url)}&height=${top.height}`).then(r => r.json());
+          if (tc && tc.playlist) {
+            window.__transcodeId = tc.id;
+            top.kind = 'hls';
+            top.sessionId = tc.id;
+            newSrc = tc.playlist;
+            newType = 'application/x-mpegURL';
+          }
+        } catch (e) {}
+      }
+
+      if (newSrc) {
         window.__currentStream = {
           src: newSrc,
           type: newType,
           mp4Sources: validSources,
-          dashUrl: validDASH.length > 0 ? validDASH[0].url : '',
+          dashUrl: dashEntry ? dashEntry.url : '',
           hlsUrl: validHLS.length > 0 ? validHLS[0].url : '',
           captionData: captionData,
           resolutions: resolutions,
+          qualityPlan: qualityPlan,
+          dashCodec: dashCodec,
+          dashIsHevc: dashIsHevc,
+          hevcOK: canPlayHEVC(),
           isEmbed: false,
         };
 

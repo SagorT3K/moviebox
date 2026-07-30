@@ -3,12 +3,15 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>MovieBox - Watch Movies & TV Shows Online</title>
+  <title>HD-MovieBox - Watch Movies & TV Shows Online</title>
   <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="overlay-nav.css">
   <!-- ArtPlayer -->
   <script src="https://cdn.jsdelivr.net/npm/artplayer@5.1.7/dist/artplayer.min.js"></script>
   <!-- dash.js for DASH streaming -->
   <script src="https://cdn.jsdelivr.net/npm/dashjs@4.7.4/dist/dash.all.min.js"></script>
+  <!-- hls.js for transcoded HLS fallback -->
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js"></script>
   <!-- ArtPlayer DASH control plugin -->
   <script src="https://cdn.jsdelivr.net/npm/artplayer-plugin-dash-control@1.1.0/dist/artplayer-plugin-dash-control.min.js"></script>
 </head>
@@ -17,8 +20,8 @@
   <!-- Sidebar -->
   <aside class="sidebar" id="sidebar">
     <div class="sidebar-logo">
-      <svg class="logo-icon" viewBox="0 0 24 24" fill="currentColor"><path d="M18 3v2h-2V3H8v2H6V3H4v18h16V3h-2zM8 17H6v-2h2v2zm0-4H6v-2h2v2zm0-4H6V7h2v2zm6 8h-4v-2h4v2zm0-4h-4v-2h4v2zm0-4h-4V7h4v2zm4 8h-2v-2h2v2zm0-4h-2v-2h2v2zm0-4h-2V7h2v2z"/></svg>
-      <span>Movie<span class="text-green">Box</span></span>
+      <img src="image-1.apJjVir2.svg" alt="HD-MovieBox" class="logo-icon logo-icon-img">
+      <span class="logo-word"><span class="logo-hd">HD</span><span class="logo-dash">-</span>Movie<span class="text-green">Box</span></span>
     </div>
 
     <!-- Language Selector -->
@@ -58,24 +61,24 @@
         <span>Top IMDB Rated</span>
       </a>
       <div class="nav-divider"></div>
-      <a href="#" class="nav-item nav-disabled" title="Coming Soon">
+      <a href="#" class="nav-item nav-disabled" title="Not available right now">
         <svg viewBox="0 0 24 24" fill="currentColor"><path d="M17 1.01L7 1c-1.1 0-2 .9-2 2v18c0 1.1.9 2 2 2h10c1.1 0 2-.9 2-2V3c0-1.1-.9-1.99-2-1.99zM17 19H7V5h10v14z"/></svg>
         <span>MovieBox App</span>
       </a>
-      <a href="#" class="nav-item nav-disabled" title="Coming Soon">
+      <a href="#" class="nav-item nav-disabled" title="Not available right now">
         <svg viewBox="0 0 24 24" fill="currentColor"><path d="M18 4v2h-2V4H8v2H6V4H4v18h16V4h-2zM8 18H6v-2h2v2zm0-4H6v-2h2v2zm6 4h-4v-2h4v2zm0-4h-4v-2h4v2zm4 4h-2v-2h2v2zm0-4h-2v-2h2v2z"/></svg>
         <span>Moviebox TV APK</span>
       </a>
-      <a href="#" class="nav-item nav-disabled" title="Coming Soon">
+      <a href="#" class="nav-item nav-disabled" title="Not available right now">
         <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/></svg>
         <span>FM Download</span>
       </a>
-      <a href="#" class="nav-item nav-disabled" title="Coming Soon">
+      <a href="#" class="nav-item nav-disabled" title="Not available right now">
         <svg viewBox="0 0 24 24" fill="currentColor"><path d="M21 6H3c-1.1 0-2 .9-2 2v8c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm-10 7H8v3H6v-3H3v-2h3V8h2v3h3v2zm4.5 2c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zm4-3c-.83 0-1.5-.67-1.5-1.5S18.67 9 19.5 9s1.5.67 1.5 1.5-.67 1.5-1.5 1.5z"/></svg>
         <span>Games</span>
       </a>
       <div class="nav-divider"></div>
-      <a href="#" class="nav-item nav-featured" data-page="premium">
+      <a href="#" class="nav-item nav-featured nav-disabled" title="Not available right now">
         <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 17.27L18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z"/></svg>
         <span>Premium Center</span>
       </a>
@@ -119,11 +122,11 @@
         <input type="text" id="searchInput" placeholder="Search movies/ TV Shows" />
       </div>
       <div class="topbar-actions">
-        <a href="#" class="topbar-btn btn-premium">
+        <a href="#" class="topbar-btn btn-premium soon-faded" title="Not available right now">
           <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 17.27L18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z"/></svg>
           Go Premium
         </a>
-        <a href="#" class="topbar-btn btn-download">
+        <a href="#" class="topbar-btn btn-download soon-faded" title="Not available right now">
           <svg viewBox="0 0 24 24" fill="currentColor"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
           Download App
         </a>
@@ -143,5 +146,6 @@
   </main>
 
   <script src="app.js"></script>
+  <script src="overlay-nav.js"></script>
 </body>
 </html>

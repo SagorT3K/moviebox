@@ -1,9 +1,15 @@
 const express = require('express');
 const fetch = require('node-fetch');
 const path = require('path');
+const fs = require('fs');
+const os = require('os');
+const crypto = require('crypto');
+const { spawn } = require('child_process');
+const https = require('https');
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
+const API_URL = process.env.API_URL || 'http://localhost:8000';
 
 // TMDB for metadata (set TMDB_API_KEY env var for production)
 const TMDB_KEY = process.env.TMDB_API_KEY || '2dca580c2a14b55200e784d157207b4d';
@@ -11,7 +17,7 @@ const TMDB_BASE = 'https://api.themoviedb.org/3';
 const TMDB_IMG = 'https://image.tmdb.org/t/p/w500';
 
 // Moviebox-API for search & content
-const MOVIEBOX_API = 'http://localhost:8000';
+const MOVIEBOX_API = API_URL;
 
 // CDN proxy headers (bypass CORS/Referer)
 const CDN_HEADERS = {
@@ -103,6 +109,298 @@ app.get('/api/proxy', async (req, res) => {
   }
 });
 
+// --- VIDEO DOWNLOAD (sets Content-Disposition: attachment) ---
+app.get('/api/download', async (req, res) => {
+  const { url, title } = req.query;
+  if (!url) return res.status(400).send('Missing url');
+
+  // Validate URL — only allow known CDN hosts
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname;
+    const isAllowed = ALLOWED_PROXY_HOSTS.some(h => host === h || host.endsWith('.' + h));
+    if (!isAllowed) {
+      return res.status(403).send('Host not allowed');
+    }
+  } catch (e) {
+    return res.status(400).send('Invalid URL');
+  }
+
+  try {
+    const proxyHeaders = { ...CDN_HEADERS };
+
+    const response = await fetch(url, {
+      headers: proxyHeaders,
+      redirect: 'follow',
+      timeout: 60000,
+    });
+
+    if (!response.ok) {
+      return res.status(response.status).send(`Upstream error: ${response.status}`);
+    }
+
+    // Build filename from title
+    const cleanTitle = (title || 'download').replace(/[^\w\s\-]/g, '').replace(/\s+/g, '_').substring(0, 80);
+    const contentType = response.headers.get('content-type') || 'video/mp4';
+    const ext = contentType.includes('mp4') ? '.mp4' : contentType.includes('webm') ? '.webm' : '.mp4';
+    const filename = `${cleanTitle}${ext}`;
+
+    // Content-Length for progress
+    const contentLength = response.headers.get('content-length');
+    if (contentLength) res.setHeader('Content-Length', contentLength);
+
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    response.body.pipe(res);
+  } catch (e) {
+    console.error('Download error:', e.message);
+    res.status(500).send('Download failed');
+  }
+});
+
+// --- HEVC -> H.264 TRANSCODE ----
+// Some movies/series lock higher resolutions (1080p/720p/480p) behind VIP and
+// only expose them inside an HEVC (h265) DASH stream. Browsers without HEVC
+// hardware support then play audio-only with a black screen. These endpoints
+// transcode any DASH representation to H.264 HLS on the fly with FFmpeg.
+let FFMPEG_PATH = null;
+try { FFMPEG_PATH = require('ffmpeg-static'); } catch (e) { FFMPEG_PATH = null; }
+
+const transcodeSessions = new Map(); // id -> { proc, dir, lastTouched, videoPushed, audioPushed }
+const TRANSCODE_MAX_SESSIONS = 2;
+const TRANSCODE_TTL_MS = 20 * 60 * 1000;
+
+// Fetch a remote file and pipe it into a writable stream (returns promise)
+function pipeUrlToStream(url, out) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, { headers: CDN_HEADERS }, (resp) => {
+      if (resp.statusCode >= 300 && resp.statusCode < 400 && resp.headers.location) {
+        resp.resume();
+        pipeUrlToStream(resp.headers.location, out).then(resolve, reject);
+        return;
+      }
+      if (resp.statusCode !== 200) {
+        resp.resume();
+        reject(new Error(`Segment fetch failed: ${resp.statusCode}`));
+        return;
+      }
+      resp.on('data', (chunk) => {
+        if (!out.write(chunk)) {
+          resp.pause();
+          out.once('drain', () => resp.resume());
+        }
+      });
+      resp.on('end', resolve);
+      resp.on('error', reject);
+    });
+    req.on('error', reject);
+    req.setTimeout(30000, () => { req.destroy(new Error('Segment fetch timeout')); });
+  });
+}
+
+// Parse a DASH MPD into representation list + segment URLs
+async function parseDashForTranscode(mpdUrl) {
+  const response = await fetch(mpdUrl, {
+    headers: { ...CDN_HEADERS, 'Accept': 'application/dash+xml, application/xml, */*' },
+    redirect: 'follow',
+    timeout: 20000,
+  });
+  if (!response.ok) throw new Error(`MPD fetch failed: ${response.status}`);
+  let xml = await response.text();
+
+  const durMatch = xml.match(/mediaPresentationDuration="PT(?:(\d+)H)?(?:(\d+)M)?(\d+\.?\d*)S"/);
+  let totalSec = 0;
+  if (durMatch) totalSec = (parseInt(durMatch[1] || 0) * 3600) + (parseInt(durMatch[2] || 0) * 60) + parseFloat(durMatch[3]);
+
+  const reps = [];
+  const repMatches = xml.matchAll(/<Representation[^>]*>[\s\S]*?<\/Representation>/g);
+  for (const rep of repMatches) {
+    const block = rep[0];
+    const openTag = block.match(/<Representation[^>]*>/)[0];
+    const mime = (openTag.match(/mimeType="([^"]+)"/) || [])[1] || '';
+    const id = (openTag.match(/ id="([^"]+)"/) || [])[1];
+    const height = parseInt((openTag.match(/ height="(\d+)"/) || [])[1] || 0);
+    const isVideo = mime.startsWith('video');
+    const isAudio = mime.startsWith('audio');
+
+    const tplMatch = block.match(/<SegmentTemplate[^>]*>/);
+    if (!tplMatch || !id) continue;
+    const tpl = tplMatch[0];
+    const initTpl = (tpl.match(/ initialization="([^"]+)"/) || [])[1];
+    const mediaTpl = (tpl.match(/ media="([^"]+)"/) || [])[1];
+    const segDur = parseInt((tpl.match(/ duration="(\d+)"/) || [])[1] || 0);
+    const timescale = parseInt((tpl.match(/ timescale="(\d+)"/) || [])[1] || 1);
+    const startNumber = parseInt((tpl.match(/ startNumber="(\d+)"/) || [])[1] || 1);
+    if (!initTpl || !mediaTpl || !segDur) continue;
+
+    const unescape = (s) => s.replace(/&amp;/g, '&');
+    const fill = (t, n) => unescape(t)
+      .replace(/\$RepresentationID\$/g, encodeURIComponent(id))
+      .replace(/\$Number%0(\d)d\$/g, (_, w) => String(n).padStart(parseInt(w), '0'))
+      .replace(/\$Number\$/g, String(n));
+
+    const segSeconds = segDur / timescale;
+    const count = totalSec > 0 ? Math.ceil(totalSec / segSeconds) : 0;
+    const urls = [fill(initTpl)];
+    for (let i = 0; i < count; i++) urls.push(fill(mediaTpl, startNumber + i));
+
+    reps.push({ id, height, isVideo, isAudio, urls });
+  }
+  return { reps, duration: totalSec };
+}
+
+function killTranscodeSession(id) {
+  const s = transcodeSessions.get(id);
+  if (!s) return;
+  try { if (s.proc && !s.proc.killed) s.proc.kill('SIGKILL'); } catch (e) {}
+  try { fs.rmSync(s.dir, { recursive: true, force: true }); } catch (e) {}
+  transcodeSessions.delete(id);
+}
+
+// Periodically reap idle transcode sessions
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, s] of transcodeSessions) {
+    if (now - s.lastTouched > TRANSCODE_TTL_MS) killTranscodeSession(id);
+  }
+}, 60000).unref();
+
+app.get('/api/transcode/status', (req, res) => {
+  res.json({ ffmpeg: !!FFMPEG_PATH, sessions: transcodeSessions.size, max: TRANSCODE_MAX_SESSIONS });
+});
+
+// Start a transcode session: /api/transcode/start?url=<mpd>&height=1080
+app.get('/api/transcode/start', async (req, res) => {
+  const { url } = req.query;
+  const reqHeight = parseInt(req.query.height) || 0;
+  if (!url) return res.status(400).json({ error: 'Missing url' });
+  if (!FFMPEG_PATH) return res.status(501).json({ error: 'FFmpeg not available on server' });
+
+  try {
+    const { reps } = await parseDashForTranscode(url);
+    const videoReps = reps.filter(r => r.isVideo).sort((a, b) => b.height - a.height);
+    const audioRep = reps.find(r => r.isAudio);
+    if (!videoReps.length) return res.status(404).json({ error: 'No video tracks in manifest' });
+
+    // Pick the video rep: closest to requested height (prefer the requested one)
+    let videoRep = videoReps.find(r => r.height === reqHeight)
+      || videoReps.find(r => r.height >= reqHeight)
+      || videoReps[videoReps.length - 1];
+
+    // Enforce session limit — kill oldest
+    if (transcodeSessions.size >= TRANSCODE_MAX_SESSIONS) {
+      let oldestId = null, oldest = Infinity;
+      for (const [sid, s] of transcodeSessions) if (s.lastTouched < oldest) { oldest = s.lastTouched; oldestId = sid; }
+      if (oldestId) killTranscodeSession(oldestId);
+    }
+
+    const id = crypto.randomBytes(6).toString('hex');
+    const dir = path.join(os.tmpdir(), 'mb-transcode', id);
+    fs.mkdirSync(dir, { recursive: true });
+
+    const args = [
+      '-hide_banner', '-loglevel', 'warning',
+      '-thread_queue_size', '4096',
+      '-f', 'mp4', '-i', 'pipe:0',
+    ];
+    if (audioRep) args.push('-thread_queue_size', '4096', '-f', 'mp4', '-i', 'pipe:3');
+    args.push('-map', '0:v:0');
+    if (audioRep) args.push('-map', '1:a:0');
+    args.push(
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
+      '-pix_fmt', 'yuv420p', '-g', '48', '-sc_threshold', '0',
+    );
+    if (audioRep) args.push('-c:a', 'aac', '-b:a', '128k');
+    args.push(
+      '-f', 'hls', '-hls_time', '5', '-hls_list_size', '0',
+      '-hls_flags', 'independent_segments+program_date_time',
+      '-hls_segment_filename', path.join(dir, 'seg%05d.ts'),
+      path.join(dir, 'index.m3u8'),
+    );
+
+    const proc = spawn(FFMPEG_PATH, args, {
+      stdio: audioRep ? ['pipe', 'ignore', 'inherit', 'pipe'] : ['pipe', 'ignore', 'inherit'],
+    });
+
+    const session = { proc, dir, lastTouched: Date.now(), height: videoRep.height, done: false, error: null };
+    transcodeSessions.set(id, session);
+
+    proc.on('error', (e) => { session.error = e.message; });
+    proc.on('exit', () => {
+      session.done = true;
+      // keep files briefly for in-flight segment requests, then clean
+      setTimeout(() => killTranscodeSession(id), 60000).unref();
+    });
+
+    // Feed video and audio segments into ffmpeg in the background.
+    // IMPORTANT: both pipes must be fed in parallel — interleaving starves
+    // ffmpeg's input probing and deadlocks the pipeline.
+    (async () => {
+      try {
+        const videoOut = proc.stdin;
+        const audioOut = audioRep ? proc.stdio[3] : null;
+        const feedAll = async (urls, out) => {
+          for (const u of urls) {
+            await pipeUrlToStream(u, out);
+            session.lastTouched = Date.now();
+          }
+          out.end();
+        };
+        const feeds = [feedAll(videoRep.urls, videoOut)];
+        if (audioRep) feeds.push(feedAll(audioRep.urls, audioOut));
+        await Promise.all(feeds);
+      } catch (e) {
+        console.error('Transcode feed error:', e.message);
+        session.error = e.message;
+        try { proc.kill('SIGKILL'); } catch (err) {}
+      }
+    })();
+
+    res.json({ id, height: videoRep.height, playlist: `/api/transcode/${id}/index.m3u8` });
+  } catch (e) {
+    console.error('Transcode start error:', e.message);
+    res.status(500).json({ error: 'Transcode failed: ' + e.message });
+  }
+});
+
+app.get('/api/transcode/:id/stop', (req, res) => {
+  killTranscodeSession(req.params.id);
+  res.json({ stopped: true });
+});
+
+// Serve transcoded HLS files; waits for the file if FFmpeg hasn't produced it yet
+app.get('/api/transcode/:id/:file', async (req, res) => {
+  const { id, file } = req.params;
+  const session = transcodeSessions.get(id);
+  if (!session) return res.status(404).send('Session not found');
+  if (!/^[\w.-]+$/.test(file)) return res.status(400).send('Bad file');
+
+  session.lastTouched = Date.now();
+  const filePath = path.join(session.dir, file);
+
+  // Wait until FFmpeg produces the file (up to 30s)
+  for (let waited = 0; waited < 30000; waited += 250) {
+    if (fs.existsSync(filePath)) {
+      // For .ts segments make sure FFmpeg finished writing (next segment exists or proc done)
+      if (file.endsWith('.ts') && !session.done) {
+        const idx = parseInt((file.match(/seg(\d+)\.ts/) || [])[1] || 0);
+        const next = path.join(session.dir, `seg${String(idx + 1).padStart(5, '0')}.ts`);
+        if (!fs.existsSync(next)) { await new Promise(r => setTimeout(r, 500)); }
+      }
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('Content-Type', file.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/mp2t');
+      return fs.createReadStream(filePath).pipe(res);
+    }
+    if (session.error) return res.status(500).send('Transcode error: ' + session.error);
+    await new Promise(r => setTimeout(r, 250));
+  }
+  res.status(504).send('Timed out waiting for transcode output');
+});
+
 // --- TMDB helpers ---
 async function tmdbFetch(endpoint, params = {}) {
   const url = new URL(`${TMDB_BASE}${endpoint}`);
@@ -133,6 +431,56 @@ function formatTmdbMovie(item, type) {
     language: item.original_language || (item.spoken_languages && item.spoken_languages[0] && item.spoken_languages[0].iso_639_1) || '',
   };
 }
+
+// --- Recently Released Movies (hero carousel) ---
+// Movie-only feed from TMDB "Now Playing" — proper recently released movies
+// with proper landscape backdrops, genres, year and ratings.
+const TMDB_IMG_HI = 'https://image.tmdb.org/t/p/w1280';
+let tmdbGenreCache = { ts: 0, map: {} };
+
+async function tmdbGenreMap() {
+  if (Date.now() - tmdbGenreCache.ts < 6 * 3600 * 1000 && Object.keys(tmdbGenreCache.map).length) {
+    return tmdbGenreCache.map;
+  }
+  const data = await tmdbFetch('/genre/movie/list');
+  const map = {};
+  for (const g of (data?.genres || [])) map[g.id] = g.name;
+  if (Object.keys(map).length) tmdbGenreCache = { ts: Date.now(), map };
+  return map;
+}
+
+app.get('/api/recent-movies', async (req, res) => {
+  const [genreMap, nowPlaying] = await Promise.all([
+    tmdbGenreMap(),
+    tmdbFetch('/movie/now_playing', { page: 1 }),
+  ]);
+
+  let results = (nowPlaying?.results || []).filter(m => m.backdrop_path);
+  // Fallback: latest releases via discover when now_playing is unavailable
+  if (!results.length) {
+    const today = new Date().toISOString().substring(0, 10);
+    const disc = await tmdbFetch('/discover/movie', {
+      sort_by: 'release_date.desc', 'release_date.lte': today,
+      'vote_count.gte': 10, page: 1, include_adult: false,
+    });
+    results = (disc?.results || []).filter(m => m.backdrop_path);
+  }
+
+  const items = results.slice(0, 10).map(m => ({
+    id: m.id,
+    title: m.title || 'Untitled',
+    poster: m.poster_path ? TMDB_IMG + m.poster_path : '',
+    backdrop: TMDB_IMG_HI + m.backdrop_path,
+    year: (m.release_date || '').substring(0, 4) || 'N/A',
+    rating: m.vote_average ? m.vote_average.toFixed(1) : null,
+    genre: (m.genre_ids || []).map(id => genreMap[id]).filter(Boolean).slice(0, 3).join(' · '),
+    overview: m.overview || '',
+    language: m.original_language || '',
+    type: 'movie',
+    source: 'tmdb',
+  }));
+  res.json({ items });
+});
 
 // Paginated catalog endpoints (round-robin used by Most Trending)
 app.get('/api/movies', async (req, res) => {
@@ -338,21 +686,65 @@ app.get('/api/home/categories', async (req, res) => {
 // Page 1 returns that section's items from /home; further pages pull from the
 // paginated category endpoints so the section page can keep loading more.
 const SECTION_CATEGORY = {
-  'Banner': 'movie',
-  'Trending Now': 'movie',
-  'Cinema': 'movie',
-  'Hot Short TV': 'movie',
-  'Bollywood': 'movie',
-  'Hollywood': 'movie',
-  'South Indian': 'movie',
-  'Asian': 'tv',
-  'Top Series This Week': 'tv',
-  'Top Anime Series': 'tv',
-  'Best Asian Dramas': 'tv',
-  'Indian Dramas': 'tv',
-  'Western TV': 'tv',
-  'Turkish Drama': 'tv',
+  'banner': 'movie',
+  'trending now': 'movie',
+  'cinema': 'movie',
+  'hot short tv': 'movie',
+  'bollywood': 'movie',
+  'hollywood': 'movie',
+  'south indian': 'movie',
+  'popular movie': 'movie',
+  'asian': 'tv',
+  'top series this week': 'tv',
+  'top anime series': 'tv',
+  'best asian dramas': 'tv',
+  'indian dramas': 'tv',
+  'western tv': 'tv',
+  'turkish drama': 'tv',
+  'popular series': 'tv',
+  'sitcom': 'tv',
+  'teen romance': 'tv',
+  'superhero series': 'tv',
+  'teen fantasy': 'tv',
+  'gangster': 'tv',
+  'epic fantasy': 'tv',
+  'action&thriller': 'tv',
+  'bet+': 'tv',
+  'adult animation': 'tv',
+  'bl story': 'tv',
+  'c-drama': 'tv',
+  'k-drama': 'tv',
 };
+
+// Resolve which paginated catalog (movie/tv/animation) feeds a section's
+// "More" pages. Static map first, then /home/categories (cached), then
+// keyword heuristics as a last resort.
+let sectionCatCache = { ts: 0, map: {} };
+async function resolveSectionCategory(name) {
+  const key = (name || '').replace(/^[^\w+]+|[^\w+]+$/g, '').toLowerCase();
+  if (SECTION_CATEGORY[key]) return SECTION_CATEGORY[key];
+
+  if (Date.now() - sectionCatCache.ts > 5 * 60 * 1000) {
+    try {
+      const data = await movieboxFetch('/home/categories');
+      const map = {};
+      if (data && data.categories) {
+        for (const [cat, sections] of Object.entries(data.categories)) {
+          for (const s of (sections || [])) {
+            const sk = (s.title || '').replace(/^[^\w+]+|[^\w+]+$/g, '').toLowerCase();
+            if (sk) map[sk] = cat;
+          }
+        }
+      }
+      sectionCatCache = { ts: Date.now(), map };
+    } catch (e) { /* keep old cache */ }
+  }
+  if (sectionCatCache.map[key]) return sectionCatCache.map[key];
+
+  if (/anime|animation|cartoon/.test(key)) return 'animation';
+  if (/series|sitcom|drama|tv|show/.test(key)) return 'tv';
+  return 'movie';
+}
 
 app.get('/api/section', async (req, res) => {
   const name = (req.query.name || '').replace(/^[^\w]+|[^\w]+$/g, ''); // strip leading/trailing emoji
@@ -386,7 +778,7 @@ app.get('/api/section', async (req, res) => {
   }
 
   // Pages > 1 (or fallback) — pull from the mapped paginated category endpoint
-  const cat = SECTION_CATEGORY[name] || 'movie';
+  const cat = await resolveSectionCategory(name);
   const endpoint = cat === 'movie' ? '/api/movies' : cat === 'tv' ? '/api/tv-series' : '/api/animation';
   const data = await movieboxFetch(`${endpoint.replace('/api', '')}?page=${page}`);
   if (!data) return res.json({ title: name, page, items: [], hasMore: false });
@@ -406,6 +798,18 @@ app.get('/api/section', async (req, res) => {
   });
 });
 
+// Search suggestions (autocomplete)
+app.get('/api/search/suggest', async (req, res) => {
+  const q = req.query.q;
+  if (!q || q.length < 1) return res.json({ suggestions: [] });
+
+  const data = await movieboxFetch(`/search/suggest?q=${encodeURIComponent(q)}`);
+  if (data && data.suggestions) {
+    return res.json({ suggestions: data.suggestions });
+  }
+  res.json({ suggestions: [] });
+});
+
 // Search - Moviebox-API first (has Hindi/Tamil/Telugu), fallback TMDB
 app.get('/api/search', async (req, res) => {
   const q = req.query.q;
@@ -421,6 +825,9 @@ app.get('/api/search', async (req, res) => {
       slug: item.slug,
       year: item.year || '',
       badge: item.badge || '',
+      rating: item.rating || null,
+      genre: item.genre || '',
+      country: item.country || '',
       source: 'moviebox',
       type: 'moviebox',
     }));
