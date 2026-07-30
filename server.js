@@ -28,6 +28,79 @@ const CDN_HEADERS = {
   'Accept-Language': 'en-US,en;q=0.9',
 };
 
+// --- Direct upstream stream resolver ---
+// Upstream (moviebox.ph / aoneroom) serves EMPTY stream lists to serverless
+// IPs (Vercel/AWS), so the play API can't live on the backend anymore — it is
+// resolved here, on this always-on host, whose IP gets real stream data.
+const MB_API_BASE = 'https://h5-api.aoneroom.com/wefeed-h5api-bff';
+
+const MB_PLAYER_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
+  'Accept': 'application/json',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Cache-Control': 'no-cache',
+  'Pragma': 'no-cache',
+  'X-Client-Info': '{"timezone":"Asia/Dhaka"}',
+  'sec-ch-ua': '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"',
+  'sec-ch-ua-mobile': '?0',
+  'sec-ch-ua-platform': '"Windows"',
+  'sec-fetch-dest': 'empty',
+  'sec-fetch-mode': 'cors',
+  'sec-fetch-site': 'same-origin',
+};
+
+// Domain + guest token are cached, refreshed when stale
+let mbSession = { ts: 0, domain: null, token: null };
+async function mbGetSession(forceRefresh = false) {
+  if (!forceRefresh && mbSession.domain && Date.now() - mbSession.ts < 10 * 60 * 1000) {
+    return mbSession;
+  }
+  const res = await fetch(`${MB_API_BASE}/media-player/get-domain`, {
+    headers: {
+      ...CDN_HEADERS,
+      'Accept': 'application/json',
+    },
+    timeout: 10000,
+  });
+  const data = await res.json();
+  const domain = String(data.data || 'https://netfilm.world/').replace(/\/+$/, '');
+
+  // A fresh guest JWT rides the x-user response header / set-cookie
+  let token = null;
+  const xUser = res.headers.get('x-user');
+  if (xUser) {
+    try { token = JSON.parse(xUser).token || null; } catch (e) {}
+  }
+  if (!token) {
+    const cookie = res.headers.get('set-cookie') || '';
+    const m = cookie.match(/token=([^;]+)/);
+    if (m) token = m[1];
+  }
+
+  mbSession = { ts: Date.now(), domain, token: token || mbSession.token };
+  return mbSession;
+}
+
+// Fetch play data (streams/dash/hls) directly from the player domain
+async function mbFetchPlay(subjectId, slug, se, ep, forceRefresh = false) {
+  const { domain, token } = await mbGetSession(forceRefresh);
+  const referer = `${domain}/spa/videoPlayPage/movies/${slug}?id=${subjectId}&type=/movie/detail&detailSe=${se}&detailEp=${ep}&lang=en`;
+  const url = `${domain}/wefeed-h5api-bff/subject/play?subjectId=${subjectId}&se=${se}&ep=${ep}&detailPath=${encodeURIComponent(slug)}`;
+  const headers = { ...MB_PLAYER_HEADERS, 'Referer': referer };
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+
+  const res = await fetch(url, { headers, redirect: 'follow', timeout: 20000 });
+  if (!res.ok) throw new Error(`play fetch ${res.status}`);
+  const json = await res.json();
+  let data = json.data || {};
+
+  // Retry once with a fresh session if upstream served an empty payload
+  if (!forceRefresh && !data.hasResource && !(data.streams || []).length) {
+    data = await mbFetchPlay(subjectId, slug, se, ep, true);
+  }
+  return data;
+}
+
 app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.json());
 
@@ -928,15 +1001,48 @@ app.get('/api/detail', async (req, res) => {
   });
 });
 
-// Stream - Moviebox-API
+// Stream - resolved directly on this host (upstream blocks serverless IPs);
+// falls back to Moviebox-API if the direct fetch fails.
 app.get('/api/stream', async (req, res) => {
   const { subject_id, slug, se, ep } = req.query;
   if (!subject_id || !slug) return res.status(400).json({ error: 'Missing params' });
 
   const season = se || 1;
   const episode = ep || 1;
-  const data = await movieboxFetch(`/api/stream/${subject_id}?detail_path=${slug}&se=${season}&ep=${episode}`);
 
+  try {
+    const play = await mbFetchPlay(subject_id, slug, season, episode);
+    const sources = (play.streams || []).map(s => ({
+      resolution: `${s.resolutions}p`,
+      format: s.format,
+      url: s.url,
+      size: s.size,
+      duration: s.duration,
+      codec: s.codecName,
+    }));
+    const hasResource = !!play.hasResource && (sources.length > 0 || (play.dash || []).length > 0 || (play.hls || []).length > 0);
+
+    if (hasResource) {
+      return res.json({
+        subject_id,
+        se: season,
+        ep: episode,
+        has_resource: true,
+        sources,
+        hls: play.hls || [],
+        dash: play.dash || [],
+        free_episodes: play.freeNum,
+        limited: play.limited || false,
+        note: null,
+      });
+    }
+  } catch (e) {
+    console.error('Direct stream error:', e.message);
+  }
+
+  // Fallback: Moviebox-API (Vercel) — currently IP-blocked upstream, but
+  // kept as a fallback in case direct resolution breaks.
+  const data = await movieboxFetch(`/api/stream/${subject_id}?detail_path=${slug}&se=${season}&ep=${episode}`);
   if (!data) return res.status(502).json({ error: 'Stream fetch failed' });
 
   // Return ALL streams (including VIP-locked with empty URLs) so client can show all resolutions
@@ -1022,7 +1128,7 @@ app.get('/api/dash-manifest', async (req, res) => {
   }
 });
 
-// Captions/Subtitles — proxy from Moviebox-API
+// Captions/Subtitles — resolved directly on this host (same reason as /api/stream)
 app.get('/api/stream/:subject_id/captions', async (req, res) => {
   const { subject_id } = req.params;
   const { detail_path, se, ep } = req.query;
@@ -1030,9 +1136,42 @@ app.get('/api/stream/:subject_id/captions', async (req, res) => {
 
   const season = se || 1;
   const episode = ep || 1;
-  const data = await movieboxFetch(`/api/stream/${subject_id}/captions?detail_path=${encodeURIComponent(detail_path)}&se=${season}&ep=${episode}`);
+  const empty = { subject_id, se: season, ep: episode, count: 0, captions: [] };
 
-  if (!data) return res.status(502).json({ error: 'Captions fetch failed', count: 0, captions: [] });
+  try {
+    const play = await mbFetchPlay(subject_id, detail_path, season, episode);
+    const streams = play.streams || [];
+    const dash = play.dash || [];
+
+    let streamId = null;
+    let streamFormat = null;
+    if (streams.length) {
+      streamId = streams[0].id;
+      streamFormat = streams[0].format || 'MP4';
+    } else if (dash.length) {
+      streamId = dash[0].id;
+      streamFormat = dash[0].format || 'DASH';
+    }
+    if (!streamId) return res.json(empty);
+
+    const { token } = await mbGetSession();
+    const capHeaders = { ...CDN_HEADERS, 'Accept': 'application/json' };
+    if (token) capHeaders['Authorization'] = `Bearer ${token}`;
+    const capUrl = `${MB_API_BASE}/subject/caption?format=${encodeURIComponent(streamFormat)}&id=${streamId}&subjectId=${subject_id}&detailPath=${encodeURIComponent(detail_path)}`;
+    const capRes = await fetch(capUrl, { headers: capHeaders, redirect: 'follow', timeout: 15000 });
+    if (capRes.ok) {
+      const capData = await capRes.json();
+      const inner = capData.data;
+      const captions = (inner && inner.captions) || (Array.isArray(inner) ? inner : []);
+      return res.json({ subject_id, se: season, ep: episode, count: captions.length, captions });
+    }
+  } catch (e) {
+    console.error('Direct captions error:', e.message);
+  }
+
+  // Fallback: Moviebox-API (Vercel)
+  const data = await movieboxFetch(`/api/stream/${subject_id}/captions?detail_path=${encodeURIComponent(detail_path)}&se=${season}&ep=${episode}`);
+  if (!data) return res.status(502).json({ error: 'Captions fetch failed', ...empty });
   res.json(data);
 });
 
