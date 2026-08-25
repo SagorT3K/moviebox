@@ -431,15 +431,15 @@ async function loadHomePage() {
       const year = it.year || '';
       const genre = it.genre || '';
       return `
-        <div class="hero-slide${i === 0 ? ' active' : ''}" data-source="${it.source || 'tmdb'}" data-type="${it.type || 'movie'}" data-id="${it.id || ''}" data-slug="${it.slug || ''}">
-          <img src="${img}" alt="${esc(it.title)}" class="hero-backdrop" loading="${i === 0 ? 'eager' : 'lazy'}">
+        <div class="hero-slide${i === 0 ? ' active' : ''}" data-source="${esc(it.source || 'tmdb')}" data-type="${esc(it.type || 'movie')}" data-id="${esc(it.id || '')}" data-slug="${esc(it.slug || '')}">
+          <img src="${safeUrl(img)}" alt="${esc(it.title)}" class="hero-backdrop" loading="${i === 0 ? 'eager' : 'lazy'}">
           <div class="hero-overlay"></div>
           <div class="hero-content">
             <h2 class="hero-title">${esc(it.title)}</h2>
             <div class="hero-meta">
-              ${year ? `<span class="hero-year">${year}</span>` : ''}
+              ${year ? `<span class="hero-year">${esc(year)}</span>` : ''}
               ${genre ? `<span class="hero-genre">${esc(genre)}</span>` : ''}
-              ${it.rating ? `<span class="hero-rating">⭐ ${it.rating}</span>` : ''}
+              ${it.rating ? `<span class="hero-rating">⭐ ${esc(it.rating)}</span>` : ''}
             </div>
             <button class="hero-play-btn" data-action="play">
               <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
@@ -1356,7 +1356,7 @@ async function searchMovies(query) {
 // --- Card ---
 function renderCard(movie) {
   const poster = movie.poster
-    ? `<img src="${movie.poster}" alt="${esc(movie.title)}" loading="lazy">`
+    ? `<img src="${safeUrl(movie.poster)}" alt="${esc(movie.title)}" loading="lazy">`
     : `<div class="no-poster"><svg viewBox="0 0 24 24" fill="currentColor" width="32" height="32"><path d="M18 4l2 4h-3l-2-4h-2l2 4h-3l-2-4H8l2 4H7L5 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V4h-4z"/></svg></div>`;
 
   // Determine language (prefer explicit movie.language) and quality
@@ -1377,7 +1377,7 @@ function renderCard(movie) {
   }
 
   return `
-    <div class="movie-card" data-source="${movie.source || 'tmdb'}" data-type="${movie.type || 'movie'}" data-id="${movie.id || ''}" data-slug="${movie.slug || ''}">
+    <div class="movie-card" data-source="${esc(movie.source || 'tmdb')}" data-type="${esc(movie.type || 'movie')}" data-id="${esc(movie.id || '')}" data-slug="${esc(movie.slug || '')}">
       <div class="card-poster">
         ${poster}
         ${badgeHtml}
@@ -1392,7 +1392,7 @@ function renderCard(movie) {
       </div>
       <div class="card-info">
         <div class="card-title" title="${esc(displayTitle)}">${esc(displayTitle)}</div>
-        <div class="card-meta">${movie.year || ''}${rating ? ' · ⭐ ' + rating : ''}</div>
+        <div class="card-meta">${esc(movie.year || '')}${rating ? ' · ⭐ ' + esc(rating) : ''}</div>
       </div>
     </div>`;
 }
@@ -1787,7 +1787,7 @@ async function openDetail(source, type, id, slug) {
 
     // Render
     const genres = (detail.genres || []).map(g => `<span>${esc(g)}</span>`).join(' / ');
-    const cornerHtml = detail.corner ? `<span class="detail-badge">${detail.corner}</span>` : '';
+    const cornerHtml = detail.corner ? `<span class="detail-badge">${esc(detail.corner)}</span>` : '';
 
     // Build download resolution options from MP4 sources only (DASH can't be directly downloaded)
     const mp4Sources = (streamData && streamData.sources || []).filter(s => s.url && s.url.length > 0);
@@ -1854,8 +1854,8 @@ async function openDetail(source, type, id, slug) {
           </div>
           <div class="detail-meta">
             ${cornerHtml}
-            ${detail.year ? `<span>${detail.year}</span>` : ''}
-            ${detail.country ? `<span>${detail.country}</span>` : ''}
+            ${detail.year ? `<span>${esc(detail.year)}</span>` : ''}
+            ${detail.country ? `<span>${esc(detail.country)}</span>` : ''}
             <span>${genres}</span>
           </div>
           ${detail.rating ? `<div style="margin-bottom:12px;"><span class="detail-rating">⭐ ${detail.rating}</span><span class="detail-rating-count">${(detail.ratingCount || 0).toLocaleString()} people rated</span></div>` : ''}
@@ -1937,7 +1937,7 @@ function initEmbedPlayer(src, servers) {
   let serverBtnsHtml = '';
   if (servers.length > 1) {
     serverBtnsHtml = `<div class="server-selector" id="serverSelector">
-      ${servers.map((s, i) => `<button class="server-btn${i === 0 ? ' active' : ''}" data-url="${s.url}">${s.name || s.label}</button>`).join('')}
+      ${servers.map((s, i) => `<button class="server-btn${i === 0 ? ' active' : ''}" data-url="${esc(s.url)}">${esc(s.name || s.label || 'Server')}</button>`).join('')}
     </div>`;
   }
 
@@ -1947,7 +1947,7 @@ function initEmbedPlayer(src, servers) {
     bindEmbedServerButtons();
   }
 
-  frame.innerHTML = `<iframe id="movie-iframe" src="${src}" allowfullscreen allow="autoplay; fullscreen; picture-in-picture" style="width:100%;aspect-ratio:16/9;border:none;border-radius:12px;"></iframe>`;
+  frame.innerHTML = `<iframe id="movie-iframe" src="${safeUrl(src)}" allowfullscreen allow="autoplay; fullscreen; picture-in-picture" style="width:100%;aspect-ratio:16/9;border:none;border-radius:12px;"></iframe>`;
 }
 
 function bindEmbedServerButtons() {
@@ -1959,7 +1959,7 @@ function bindEmbedServerButtons() {
       if (url) {
         const frame = document.getElementById('playerFrame');
         if (frame) {
-          frame.innerHTML = `<iframe id="movie-iframe" src="${url}" allowfullscreen allow="autoplay; fullscreen; picture-in-picture" style="width:100%;aspect-ratio:16/9;border:none;border-radius:12px;"></iframe>`;
+          frame.innerHTML = `<iframe id="movie-iframe" src="${safeUrl(url)}" allowfullscreen allow="autoplay; fullscreen; picture-in-picture" style="width:100%;aspect-ratio:16/9;border:none;border-radius:12px;"></iframe>`;
         }
       }
     });
@@ -2708,7 +2708,20 @@ function setPlayingEpisode(epNum) {
 // --- Helpers ---
 function showLoading() { loading.classList.remove('hidden'); }
 function hideLoading() { loading.classList.add('hidden'); }
-function esc(text) { const d = document.createElement('div'); d.textContent = text || ''; return d.innerHTML; }
+function esc(text) {
+  const d = document.createElement('div');
+  d.textContent = text == null ? '' : String(text);
+  // textContent→innerHTML escapes & < > but NOT quotes — escape those too so
+  // esc() is safe inside HTML attributes, not just element content.
+  return d.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+// Only allow http(s) URLs into src/href contexts (blocks javascript:, data:, etc.)
+function safeUrl(u) {
+  try {
+    const url = new URL(u, location.origin);
+    return (url.protocol === 'https:' || url.protocol === 'http:') ? url.href : '';
+  } catch (e) { return ''; }
+}
 
 // --- Init ---
 loadPage();

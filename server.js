@@ -8,10 +8,51 @@ const { spawn } = require('child_process');
 const https = require('https');
 
 const app = express();
+// Fly's proxy terminates TLS and sets X-Forwarded-For; trust exactly one hop
+// so req.ip is the real client IP (rate limiting) without trusting spoofable XFF chains.
+app.set('trust proxy', 1);
 const PORT = process.env.PORT || 7860;
+
+// --- Baseline security headers ---
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  next();
+});
+
+// --- Lightweight in-memory rate limiter (per IP, fixed window) ---
+const rateBuckets = new Map(); // key -> { count, resetAt }
+function rateLimit({ windowMs, max }) {
+  return (req, res, next) => {
+    const ip = req.ip || req.socket.remoteAddress || 'unknown';
+    const key = `${req.path}:${ip}`;
+    const now = Date.now();
+    let bucket = rateBuckets.get(key);
+    if (!bucket || now > bucket.resetAt) {
+      bucket = { count: 0, resetAt: now + windowMs };
+      rateBuckets.set(key, bucket);
+    }
+    bucket.count++;
+    // Opportunistic cleanup so the map can't grow unbounded
+    if (rateBuckets.size > 5000) {
+      for (const [k, v] of rateBuckets) if (now > v.resetAt) rateBuckets.delete(k);
+    }
+    if (bucket.count > max) {
+      return res.status(429).json({ error: 'Too many requests. Try again later.' });
+    }
+    next();
+  };
+}
+
+// Expensive/bandwidth-heavy endpoints get strict limits; catalog reads stay open.
+const proxyLimit = rateLimit({ windowMs: 60 * 1000, max: 240 });
+const downloadLimit = rateLimit({ windowMs: 60 * 1000, max: 10 });
+const transcodeLimit = rateLimit({ windowMs: 60 * 1000, max: 4 });
 const API_URL = process.env.API_URL || 'http://localhost:8000';
 
-// TMDB for metadata (set TMDB_API_KEY env var for production)
+// TMDB for metadata. Bundled key by default; set TMDB_API_KEY env var to override.
 const TMDB_KEY = process.env.TMDB_API_KEY || '2dca580c2a14b55200e784d157207b4d';
 const TMDB_BASE = 'https://api.themoviedb.org/3';
 const TMDB_IMG = 'https://image.tmdb.org/t/p/w500';
@@ -120,7 +161,7 @@ const ALLOWED_PROXY_HOSTS = [
   'h5-api.aoneroom.com',
 ];
 
-app.get('/api/proxy', async (req, res) => {
+app.get('/api/proxy', proxyLimit, async (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).send('Missing url');
 
@@ -183,7 +224,7 @@ app.get('/api/proxy', async (req, res) => {
 });
 
 // --- VIDEO DOWNLOAD (sets Content-Disposition: attachment) ---
-app.get('/api/download', async (req, res) => {
+app.get('/api/download', downloadLimit, async (req, res) => {
   const { url, title } = req.query;
   if (!url) return res.status(400).send('Missing url');
 
@@ -346,7 +387,7 @@ app.get('/api/transcode/status', (req, res) => {
 });
 
 // Start a transcode session: /api/transcode/start?url=<mpd>&height=1080
-app.get('/api/transcode/start', async (req, res) => {
+app.get('/api/transcode/start', transcodeLimit, async (req, res) => {
   const { url } = req.query;
   const reqHeight = parseInt(req.query.height) || 0;
   if (!url) return res.status(400).json({ error: 'Missing url' });
@@ -449,7 +490,9 @@ app.get('/api/transcode/:id/:file', async (req, res) => {
   const { id, file } = req.params;
   const session = transcodeSessions.get(id);
   if (!session) return res.status(404).send('Session not found');
-  if (!/^[\w.-]+$/.test(file)) return res.status(400).send('Bad file');
+  // Strict allowlist — FFmpeg only ever writes index.m3u8 and seg%05d.ts here.
+  // The old [\w.-]+ check let "." / ".." through (directory read → stream error crash).
+  if (!/^(index\.m3u8|seg\d{5}\.ts)$/.test(file)) return res.status(400).send('Bad file');
 
   session.lastTouched = Date.now();
   const filePath = path.join(session.dir, file);
@@ -475,7 +518,15 @@ app.get('/api/transcode/:id/:file', async (req, res) => {
 });
 
 // --- TMDB helpers ---
+let tmdbKeyWarned = false;
 async function tmdbFetch(endpoint, params = {}) {
+  if (!TMDB_KEY) {
+    if (!tmdbKeyWarned) {
+      console.warn('TMDB_API_KEY env var is not set — TMDB features (recent-movies, cast, tmdb-id) are disabled.');
+      tmdbKeyWarned = true;
+    }
+    return null;
+  }
   const url = new URL(`${TMDB_BASE}${endpoint}`);
   url.searchParams.set('api_key', TMDB_KEY);
   Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
@@ -646,7 +697,10 @@ app.get('/api/genre/:name', async (req, res) => {
 // --- Moviebox-API helper ---
 async function movieboxFetch(endpoint) {
   try {
-    const res = await fetch(`${MOVIEBOX_API}${endpoint}`, { timeout: 10000 });
+    const headers = {};
+    // Optional shared-secret auth (pairs with the API_KEY guard in moviebox-api)
+    if (process.env.MOVIEBOX_API_KEY) headers['X-API-Key'] = process.env.MOVIEBOX_API_KEY;
+    const res = await fetch(`${MOVIEBOX_API}${endpoint}`, { headers, timeout: 10000 });
     if (!res.ok) throw new Error(`Moviebox-API ${res.status}`);
     return await res.json();
   } catch (e) {
