@@ -3,7 +3,9 @@
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'moviebox-frontend'
+# Live Fly app is "hdmoviebox" (hdmoviebox.fly.dev) — the old
+# "moviebox-frontend" app no longer exists and broke CI deploys.
+app = 'hdmoviebox'
 primary_region = 'sin'
 
 [build]
