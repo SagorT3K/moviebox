@@ -387,12 +387,70 @@ async function loadPage() {
 }
 
 // --- Home page with sectioned layout ---
+// Fetch upstream /home straight from the browser. The section list is
+// REGIONAL (upstream decides by client IP), so each visitor gets the same
+// variant moviebox.ph would show them — BD visitors see Trending Now /
+// Cinema / Bollywood exactly like the real site. Server /api/home is the
+// fallback (its datacenter IP gets a different A/B variant).
+async function fetchUpstreamHomeSections() {
+  const res = await fetch('https://h5-api.aoneroom.com/wefeed-h5api-bff/home?host=moviebox.ph', {
+    headers: { 'Accept': 'application/json' },
+  });
+  if (!res.ok) throw new Error('upstream home ' + res.status);
+  const data = await res.json();
+  const sections = [];
+  for (const op of (data?.data?.operatingList || [])) {
+    const type = op.type || '';
+    const title = op.title || 'Featured';
+    if (type === 'BANNER') {
+      const items = (op.banner?.items || [])
+        .filter(it => !/Communities/i.test(it.title || it.subject?.title || ''))
+        .map(it => {
+          const subj = it.subject || {};
+          return {
+            id: it.subjectId || subj.subjectId,
+            title: it.title || subj.title || 'Untitled',
+            poster: it.image?.url || subj.cover?.url || '',
+            backdrop: it.image?.url || subj.cover?.url || '',
+            slug: it.detailPath || subj.detailPath,
+            badge: subj.corner || '',
+            source: 'moviebox',
+            type: 'moviebox',
+          };
+        });
+      if (items.length) sections.push({ title: 'Banner', items });
+    } else if (/^SUBJECTS_(MOVIE|TV|ANIMATION)$/.test(type)) {
+      const items = (op.subjects || []).map(sub => ({
+        id: sub.subjectId,
+        title: sub.title || 'Untitled',
+        poster: sub.cover?.url || '',
+        backdrop: sub.stills?.url || sub.cover?.url || '',
+        slug: sub.detailPath,
+        badge: sub.corner || '',
+        rating: sub.imdbRatingValue || null,
+        year: (sub.releaseDate || '').substring(0, 4) || '',
+        genre: sub.genre || '',
+        source: 'moviebox',
+        type: 'moviebox',
+      }));
+      if (items.length) sections.push({ title, items });
+    }
+  }
+  if (!sections.length) throw new Error('empty upstream home');
+  return sections;
+}
+
 async function loadHomePage() {
   // Show light skeletons while we fetch data to avoid blank content
   contentArea.innerHTML = `<div class="hero-banner skeleton-hero" style="height:400px;margin-bottom:32px;border-radius:12px;background:linear-gradient(90deg,#0d0d0d,#111)"></div><div id="skeletonRows"></div>`;
 
-  const data = await apiFetch('/api/home');
-  const sections = data.sections || [];
+  // Regional home: browser-direct upstream first, server endpoint as fallback
+  let sections = [];
+  try { sections = await fetchUpstreamHomeSections(); } catch (e) { /* fall through */ }
+  if (!sections.length) {
+    const data = await apiFetch('/api/home');
+    sections = data.sections || [];
+  }
 
   if (!sections.length) {
     contentArea.innerHTML = '<div class="no-results"><p>No content found</p></div>';
