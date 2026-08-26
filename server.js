@@ -1298,6 +1298,92 @@ app.get('/api/tmdb-id', async (req, res) => {
   });
 });
 
+// --- Related videos (moviebox-style "recommend" sidebar) ---
+// Uses the moviebox-api genre pool (server-side cached) filtered by the
+// item's first genre; falls back to home sections when no genre matches.
+app.get('/api/related', async (req, res) => {
+  const { slug, genre, type } = req.query;
+  const wantType = ['movie', 'tv', 'animation'].includes(type) ? type : 'movie';
+  const seen = new Set();
+  const items = [];
+
+  const pushItem = (it) => {
+    const s = it.slug;
+    if (!s || seen.has(s) || s === slug) return;
+    seen.add(s);
+    items.push({
+      subject_id: it.subject_id || it.id,
+      name: it.name || it.title,
+      poster_url: it.poster_url || it.poster || '',
+      slug: s,
+      rating: it.rating || null,
+      year: it.year || '',
+    });
+  };
+
+  const firstGenre = String(genre || '').split(',')[0].trim();
+  if (firstGenre) {
+    const data = await movieboxFetch(`/genre/${encodeURIComponent(firstGenre)}?type=${wantType}&page=1`);
+    for (const it of (data?.items || [])) pushItem(it);
+    // Genre pool can be sparse — top up from the type's main feed
+    if (items.length < 12) {
+      const feed = await movieboxFetch(`/${wantType === 'tv' ? 'tv-series' : wantType}`);
+      for (const it of (feed?.items || [])) pushItem(it);
+    }
+  }
+  if (items.length < 12) {
+    const home = await movieboxFetch('/home');
+    for (const s of (home?.sections || [])) for (const it of (s.items || [])) pushItem(it);
+  }
+
+  res.json({ items: items.slice(0, 12) });
+});
+
+// --- Community comments (free, no accounts) ---
+// Stored in data/comments.json on the machine's disk. Fly machines have an
+// ephemeral root filesystem, so comments survive restarts of the same machine
+// but are lost on a fresh deploy/machine — acceptable for v1.
+const COMMENTS_DIR = path.join(__dirname, 'data');
+const COMMENTS_FILE = path.join(COMMENTS_DIR, 'comments.json');
+const COMMENTS_PER_SUBJECT = 500;
+let commentsCache = null;
+
+function loadComments() {
+  if (commentsCache) return;
+  try { commentsCache = JSON.parse(fs.readFileSync(COMMENTS_FILE, 'utf8')); }
+  catch (e) { commentsCache = {}; }
+}
+function saveComments() {
+  try {
+    fs.mkdirSync(COMMENTS_DIR, { recursive: true });
+    fs.writeFileSync(COMMENTS_FILE, JSON.stringify(commentsCache));
+  } catch (e) { console.error('Comments save failed:', e.message); }
+}
+
+const commentLimit = rateLimit({ windowMs: 60 * 1000, max: 5 });
+
+app.get('/api/comments/:subjectId', (req, res) => {
+  loadComments();
+  const list = commentsCache[req.params.subjectId] || [];
+  res.json({ count: list.length, comments: list.slice(-200).reverse() });
+});
+
+app.post('/api/comments/:subjectId', commentLimit, (req, res) => {
+  loadComments();
+  const { subjectId } = req.params;
+  const name = String(req.body?.name || '').replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim().substring(0, 30) || 'Guest';
+  const text = String(req.body?.text || '').replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '').trim().substring(0, 1000);
+  const rating = Math.min(10, Math.max(1, parseInt(req.body?.rating) || 0));
+  if (text.length < 2) return res.status(400).json({ error: 'Comment is too short' });
+
+  const comment = { id: crypto.randomBytes(6).toString('hex'), name, rating: rating || null, text, ts: Date.now() };
+  const list = commentsCache[subjectId] || (commentsCache[subjectId] = []);
+  list.push(comment);
+  if (list.length > COMMENTS_PER_SUBJECT) commentsCache[subjectId] = list.slice(-COMMENTS_PER_SUBJECT);
+  saveComments();
+  res.json({ ok: true, comment });
+});
+
 // Catch-all
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));

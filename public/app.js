@@ -1830,7 +1830,8 @@ async function openDetail(source, type, id, slug) {
     }
 
     contentArea.innerHTML = `
-      <div class="detail-page">
+      <div class="detail-page layout-container">
+        <div class="layout-left-group">
         <div class="detail-nav-row">
           <button class="back-btn detail-back-btn" onclick="detailBack()">
             <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg>
@@ -1860,12 +1861,40 @@ async function openDetail(source, type, id, slug) {
           </div>
           ${detail.rating ? `<div style="margin-bottom:12px;"><span class="detail-rating">⭐ ${detail.rating}</span><span class="detail-rating-count">${(detail.ratingCount || 0).toLocaleString()} people rated</span></div>` : ''}
           ${detail.overview ? `<div class="detail-overview"><p>${esc(detail.overview)}</p></div>` : ''}
+          <div class="share-row" id="shareRow">
+            <span class="share-label">Share To</span>
+            <button class="share-btn" data-net="facebook" title="Share to Facebook"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M22 12c0-5.52-4.48-10-10-10S2 6.48 2 12c0 4.84 3.44 8.87 8 9.8V15H8v-3h2V9.5C10 7.57 11.57 6 13.5 6H16v3h-2c-.55 0-1 .45-1 1v2h3v3h-3v6.95c5.05-.5 9-4.76 9-9.95z"/></svg></button>
+            <button class="share-btn" data-net="twitter" title="Share to X"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M22.46 6c-.77.35-1.6.58-2.46.69.88-.53 1.56-1.37 1.88-2.38-.83.5-1.75.85-2.72 1.05C18.37 4.5 17.26 4 16 4c-2.35 0-4.27 1.92-4.27 4.29 0 .34.04.67.11.98C8.28 9.09 5.11 7.38 3 4.79c-.37.63-.58 1.37-.58 2.15 0 1.49.75 2.81 1.91 3.56-.71 0-1.37-.2-1.95-.5v.03c0 2.08 1.48 3.82 3.44 4.21a4.22 4.22 0 0 1-1.93.07 4.28 4.28 0 0 0 4 2.98 8.521 8.521 0 0 1-5.33 1.84c-.34 0-.68-.02-1.02-.06C3.44 20.29 5.7 21 8.12 21 16 21 20.33 14.46 20.33 8.79c0-.19 0-.37-.01-.56.84-.6 1.56-1.36 2.14-2.23z"/></svg></button>
+            <button class="share-btn" data-net="whatsapp" title="Share to WhatsApp"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M16.75 13.96c.25.13.41.2.46.3.06.1.04.42-.02.82-.06.4-.25.75-.56 1.06-.31.31-.7.53-1.17.65-.47.12-1.02.09-1.64-.08-.62-.17-1.32-.5-2.1-.98-1.29-.84-2.62-2.19-3.99-4.06-.86-1.24-1.26-2.32-1.3-3.23-.03-.91.21-1.6.7-2.09.29-.29.6-.47.95-.55.16-.04.31-.05.45-.03.14.02.26.06.36.12.1.06.18.15.24.26.06.11.15.34.27.68.12.34.24.65.35.93.11.28.17.46.19.54.02.08.01.17-.03.28-.04.11-.11.22-.22.33-.11.11-.22.2-.33.27-.11.07-.2.15-.27.24-.07.09-.1.18-.09.28.01.1.05.23.12.4.28.62.72 1.19 1.32 1.72.6.53 1.26.92 1.98 1.17.16.06.29.09.39.09.1-.01.19-.05.27-.12.08-.07.17-.17.26-.29.09-.12.18-.22.28-.3.1-.08.19-.11.27-.1.08.01.25.07.51.18.26.11.55.23.87.36.32.13.55.22.68.28z"/></svg></button>
+            <button class="share-btn" data-net="telegram" title="Share to Telegram"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M9.78 18.65l.28-4.23 7.68-6.92c.34-.31-.07-.46-.52-.19L7.74 13.3 3.64 12c-.88-.25-.89-.86.2-1.3l15.97-6.16c.73-.33 1.43.18 1.15 1.3l-2.72 12.81c-.19.91-.74 1.13-1.5.71L12.6 16.3l-1.99 1.93c-.23.23-.42.42-.83.42z"/></svg></button>
+            <button class="share-btn" data-net="copy" title="Copy link"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z"/></svg></button>
+          </div>
         </div>
         ${castHtml}
+        <div class="comments-section" id="commentsSection">
+          <h3 class="comments-title">Comments (<span id="commentCount">0</span>)</h3>
+          <form class="comment-form" id="commentForm">
+            <div class="comment-form-row">
+              <input type="text" id="commentName" maxlength="30" placeholder="Your name (optional)">
+              <select id="commentRating">
+                <option value="">Rate</option>
+                ${[10,9,8,7,6,5,4,3,2,1].map(n => `<option value="${n}">⭐ ${n}/10</option>`).join('')}
+              </select>
+            </div>
+            <textarea id="commentText" maxlength="1000" rows="3" placeholder="Write a comment... (no account needed)" required></textarea>
+            <button type="submit" class="comment-submit">Post Comment</button>
+          </form>
+          <div class="comments-list" id="commentsList"><div class="comment-empty">Loading comments...</div></div>
+        </div>
         <div class="playback-issue">
           <span>Having playback issues? Please contact us.</span>
           <button class="report-btn">⚠ Report</button>
         </div>
+        </div>
+        <aside class="layout-recommend">
+          <h3 class="recommend-title">You May Also Like</h3>
+          <div class="recommend-list" id="relatedList"><div class="comment-empty">Loading suggestions...</div></div>
+        </aside>
       </div>`;
 
     // Initialize player
@@ -1877,6 +1906,11 @@ async function openDetail(source, type, id, slug) {
 
     // Bind season/episode buttons
     bindSeasonEpisodeButtons(source, type, id);
+
+    // Moviebox-parity extras: related sidebar, community comments, share buttons
+    loadRelated(detail);
+    initComments(String(detail.id || id));
+    bindShareButtons(detail);
 
     // Bind audio (dub) switcher — each dub is its own subject upstream,
     // so switching reloads the detail page with the dub's subject/slug.
@@ -2721,6 +2755,147 @@ function safeUrl(u) {
     const url = new URL(u, location.origin);
     return (url.protocol === 'https:' || url.protocol === 'http:') ? url.href : '';
   } catch (e) { return ''; }
+}
+
+// --- Detail page: related videos sidebar (moviebox "recommend") ---
+async function loadRelated(detail) {
+  const list = document.getElementById('relatedList');
+  if (!list) return;
+  try {
+    const genre = (detail.genres || []).join(',');
+    const relType = detail.type === 'tv' ? 'tv' : 'movie';
+    const res = await fetch(`/api/related?slug=${encodeURIComponent(detail.slug || '')}&genre=${encodeURIComponent(genre)}&type=${relType}`);
+    const data = await res.json();
+    if (!list.isConnected) return;
+    list.innerHTML = (data.items || []).map(it => `
+      <div class="recommend-card" data-slug="${esc(it.slug || '')}" data-id="${esc(it.subject_id || '')}">
+        <div class="recommend-poster">${it.poster_url ? `<img src="${safeUrl(it.poster_url)}" alt="${esc(it.name)}" loading="lazy">` : '<div class="recommend-noimg"></div>'}</div>
+        <div class="recommend-info">
+          <div class="recommend-name" title="${esc(it.name)}">${esc(it.name)}</div>
+          <div class="recommend-meta">${it.year ? esc(it.year) : ''}${it.rating ? ' · ⭐ ' + esc(it.rating) : ''}</div>
+        </div>
+      </div>`).join('') || '<div class="comment-empty">No suggestions yet</div>';
+    list.querySelectorAll('.recommend-card').forEach(card => {
+      card.addEventListener('click', () => {
+        const slug = card.dataset.slug, rid = card.dataset.id;
+        if (!slug || !rid) return;
+        stopCurrentTranscode();
+        openDetail('moviebox', currentDetail && currentDetail.type === 'tv' ? 'tv' : 'movie', rid, slug);
+      });
+    });
+  } catch (e) {
+    if (list.isConnected) list.innerHTML = '';
+  }
+}
+
+// --- Detail page: community comments (free, no accounts) ---
+function commentHtml(c) {
+  return `
+    <div class="comment-item">
+      <div class="comment-avatar" style="background:${avatarColor(c.name)}">${esc((c.name || 'G')[0].toUpperCase())}</div>
+      <div class="comment-body">
+        <div class="comment-head">
+          <span class="comment-name">${esc(c.name)}</span>
+          ${c.rating ? `<span class="comment-rating">⭐ ${esc(c.rating)}/10</span>` : ''}
+          <span class="comment-time">${timeAgo(c.ts)}</span>
+        </div>
+        <div class="comment-text">${esc(c.text)}</div>
+      </div>
+    </div>`;
+}
+
+function avatarColor(name) {
+  let h = 0;
+  for (const ch of String(name || 'G')) h = (h * 31 + ch.charCodeAt(0)) % 360;
+  return `hsl(${h}, 55%, 38%)`;
+}
+
+function timeAgo(ts) {
+  const s = Math.max(1, Math.floor((Date.now() - (ts || Date.now())) / 1000));
+  if (s < 60) return 'just now';
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24);
+  if (d < 30) return `${d}d ago`;
+  return new Date(ts).toLocaleDateString();
+}
+
+async function initComments(subjectId) {
+  const listEl = document.getElementById('commentsList');
+  const form = document.getElementById('commentForm');
+  if (!listEl || !form) return;
+  const nameInput = document.getElementById('commentName');
+  const textInput = document.getElementById('commentText');
+  nameInput.value = localStorage.getItem('mb_comment_name') || '';
+
+  const render = (comments) => {
+    document.getElementById('commentCount').textContent = comments.length;
+    listEl.innerHTML = comments.map(commentHtml).join('') ||
+      '<div class="comment-empty">Be the first to comment — no account needed.</div>';
+  };
+
+  try {
+    const res = await fetch(`/api/comments/${encodeURIComponent(subjectId)}`);
+    const data = await res.json();
+    if (listEl.isConnected) render(data.comments || []);
+  } catch (e) { /* comments are optional */ }
+
+  form.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const text = textInput.value.trim();
+    if (text.length < 2) return;
+    const btn = form.querySelector('.comment-submit');
+    btn.disabled = true;
+    try {
+      const name = nameInput.value.trim();
+      localStorage.setItem('mb_comment_name', name);
+      const res = await fetch(`/api/comments/${encodeURIComponent(subjectId)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, text, rating: document.getElementById('commentRating').value })
+      });
+      const data = await res.json();
+      if (data.ok) {
+        textInput.value = '';
+        const countEl = document.getElementById('commentCount');
+        countEl.textContent = (parseInt(countEl.textContent || '0') || 0) + 1;
+        if (listEl.querySelector('.comment-empty')) listEl.innerHTML = '';
+        listEl.insertAdjacentHTML('afterbegin', commentHtml(data.comment));
+      } else {
+        alert(data.error || 'Could not post comment');
+      }
+    } catch (e) { alert('Could not post comment'); }
+    btn.disabled = false;
+  });
+}
+
+// --- Detail page: share buttons ---
+function bindShareButtons(detail) {
+  const row = document.getElementById('shareRow');
+  if (!row) return;
+  row.querySelectorAll('.share-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const url = encodeURIComponent(location.href);
+      const text = encodeURIComponent(`Watch ${detail.title || 'this title'} free on HD-MovieBox`);
+      const net = btn.dataset.net;
+      if (net === 'copy') {
+        navigator.clipboard.writeText(location.href).then(() => {
+          btn.classList.add('copied');
+          setTimeout(() => btn.classList.remove('copied'), 1200);
+        }).catch(() => {});
+        return;
+      }
+      const links = {
+        facebook: `https://www.facebook.com/sharer/sharer.php?u=${url}`,
+        twitter: `https://twitter.com/intent/tweet?url=${url}&text=${text}`,
+        whatsapp: `https://wa.me/?text=${text}%20${url}`,
+        telegram: `https://t.me/share/url?url=${url}&text=${text}`,
+      };
+      if (links[net]) window.open(links[net], '_blank', 'noopener,width=640,height=480');
+    });
+  });
 }
 
 // --- Init ---
