@@ -393,9 +393,9 @@ async function loadPage() {
 // Cinema / Bollywood exactly like the real site. Server /api/home is the
 // fallback (its datacenter IP gets a different A/B variant).
 async function fetchUpstreamHomeSections() {
-  const res = await fetch('https://h5-api.aoneroom.com/wefeed-h5api-bff/home?host=moviebox.ph', {
+  const res = await upstreamFetch('https://h5-api.aoneroom.com/wefeed-h5api-bff/home?host=moviebox.ph', {
     headers: { 'Accept': 'application/json' },
-  });
+  }, 9000);
   if (!res.ok) throw new Error('upstream home ' + res.status);
   const data = await res.json();
   const sections = [];
@@ -1383,9 +1383,87 @@ async function loadMoreGenre() {
   genreState.loading = false;
 }
 
+// --- Browser-direct upstream search (regional, like moviebox.ph) ---
+// Upstream search results are decided by client IP: BD visitors get the full
+// set incl. [Hindi] dubs, while datacenter IPs get a smaller generic set.
+// The upstream API reflects any CORS origin, so search runs in the browser.
+// Every call gets a hard timeout — on any hang/failure we fall back to the
+// server endpoint so the search page always renders.
+function upstreamFetch(url, opts = {}, ms = 8000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(timer));
+}
+
+let mbSearchToken = null;
+async function mbGetSearchToken() {
+  if (mbSearchToken) return mbSearchToken;
+  const r = await upstreamFetch('https://h5-api.aoneroom.com/wefeed-h5api-bff/home?host=moviebox.ph', {
+    headers: { 'Accept': 'application/json' },
+  });
+  const xu = r.headers.get('x-user');
+  if (xu) mbSearchToken = (JSON.parse(xu).token) || null;
+  return mbSearchToken;
+}
+
+async function fetchUpstreamSearch(rawQuery) {
+  const clean = rawQuery.replace(/\[[^\]]*\]/g, '').replace(/\s+/g, ' ').trim() || rawQuery;
+  const token = await mbGetSearchToken();
+  const headers = { 'Content-Type': 'application/json', 'Accept': 'application/json' };
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+
+  const pages = await Promise.all([1, 2, 3].map(page =>
+    upstreamFetch('https://h5-api.aoneroom.com/wefeed-h5api-bff/subject/search', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ keyword: clean, page, perPage: 20 }),
+    }, 9000).then(r => r.ok ? r.json() : null).catch(() => null)
+  ));
+
+  const merged = [];
+  const seen = new Set();
+  for (const d of pages) {
+    for (const it of (d?.data?.items || [])) {
+      const sub = it.subject || it;
+      const key = String(sub.subjectId || '');
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      merged.push({
+        id: sub.subjectId,
+        title: sub.title || 'Untitled',
+        poster: sub.cover?.url || '',
+        slug: sub.detailPath,
+        year: (sub.releaseDate || '').substring(0, 4) || '',
+        badge: sub.corner || '',
+        rating: sub.imdbRatingValue || null,
+        genre: sub.genre || '',
+        country: sub.countryName || '',
+        source: 'moviebox',
+        type: 'moviebox',
+      });
+    }
+  }
+
+  const ql = clean.toLowerCase();
+  const score = (t) => {
+    const lt = String(t || '').toLowerCase();
+    if (lt === ql) return 0;
+    if (lt.startsWith(ql)) return 1;
+    if (lt.includes(ql)) return 2;
+    return 3;
+  };
+  merged.sort((a, b) => score(a.title) - score(b.title));
+  return { movies: merged, total: merged.length };
+}
+
 async function searchMovies(query) {
   showLoading();
-  const data = await apiFetch(`/api/search?q=${encodeURIComponent(query)}`);
+  // Regional search straight from the visitor's IP, server endpoint as fallback
+  let data = null;
+  try { data = await fetchUpstreamSearch(query); } catch (e) { /* fall through */ }
+  if (!data || !data.movies || !data.movies.length) {
+    data = await apiFetch(`/api/search?q=${encodeURIComponent(query)}`);
+  }
   const movies = data.movies || [];
   if (!movies.length) {
     contentArea.innerHTML = `<div class="no-results"><p>No results for "${esc(query)}"</p></div>`;
