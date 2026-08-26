@@ -750,99 +750,132 @@ app.get('/api/trending', async (req, res) => {
   res.json({ movies: [...movies, ...tv], total: movies.length + tv.length });
 });
 
-// Home - full sectioned layout from Moviebox-API /home (with TMDB fallback)
-app.get('/api/home', async (req, res) => {
-  const data = await movieboxFetch('/home');
-  if (data && Array.isArray(data.sections) && data.sections.length > 0) {
-    const sections = data.sections
-      .filter(s => s.items && s.items.length > 0)
-      .map(s => ({
-        title: s.section,
-        items: s.items.map(item => ({
-          id: item.subject_id,
-          title: item.name || 'Untitled',
-          poster: item.poster_url || '',
-          backdrop: item.image_url || item.poster_url || '',
-          slug: item.slug,
-          badge: item.badge || '',
-          source: 'moviebox',
-          type: 'moviebox',
-          // Preserve language info from Moviebox-API when available
-          language: item.language || item.lang || item.locale || '',
-        })),
-      }));
-    if (sections.length > 0) {
-      return res.json({ sections });
-    }
-  }
-
-  // Fallback: reuse trending flat list as a single section
-  const trending = await movieboxFetch('/home');
-  if (data && data.sections) {
-    const all = [];
-    for (const s of data.sections) {
-      for (const it of (s.items || [])) {
-        all.push({
-          id: it.subject_id, title: it.name || 'Untitled',
-          poster: it.poster_url || '', slug: it.slug,
-          badge: it.badge || '', source: 'moviebox', type: 'moviebox',
+// --- Direct upstream /home mapper ---
+// The /home section list is REGIONAL: served directly from this host it
+// matches what moviebox.ph shows (Trending Now, Cinema, Bollywood, South
+// Indian, Hollywood...), while the Vercel function's IP gets a different
+// A/B variant. So home is fetched directly, with Moviebox-API as fallback.
+function mapUpstreamHome(data) {
+  const sections = [];
+  const ops = data?.data?.operatingList || [];
+  for (const op of ops) {
+    const type = op.type;
+    const title = op.title || 'Featured';
+    if (type === 'BANNER') {
+      const items = (op.banner?.items || [])
+        .filter(it => !/Communities/i.test(it.title || it.subject?.title || ''))
+        .map(it => {
+          const subj = it.subject || {};
+          return {
+            subject_id: it.subjectId || subj.subjectId,
+            name: it.title || subj.title || '',
+            poster_url: it.image?.url || subj.cover?.url || '',
+            backdrop: it.image?.url || subj.cover?.url || '',
+            slug: it.detailPath || subj.detailPath,
+            badge: subj.corner || '',
+          };
         });
-      }
+      if (items.length) sections.push({ section: 'Banner', items });
+    } else if (/^SUBJECTS_(MOVIE|TV|ANIMATION)$/.test(type || '')) {
+      const items = (op.subjects || []).map(sub => ({
+        subject_id: sub.subjectId,
+        name: sub.title || '',
+        poster_url: sub.cover?.url || '',
+        image_url: sub.stills?.url || sub.cover?.url || '',
+        slug: sub.detailPath,
+        badge: sub.corner || '',
+        rating: sub.imdbRatingValue || null,
+        year: (sub.releaseDate || '').substring(0, 4) || '',
+        genre: sub.genre || '',
+      }));
+      if (items.length) sections.push({ section: title, items });
     }
-    if (all.length) return res.json({ sections: [{ title: 'Trending', items: all.slice(0, 40) }] });
   }
-  res.json({ sections: [] });
+  return sections;
+}
+
+async function fetchHomeDirect() {
+  try {
+    const headers = { ...CDN_HEADERS, 'Accept': 'application/json' };
+    const r = await fetch(`${MB_API_BASE}/home?host=moviebox.ph`, { headers, redirect: 'follow', timeout: 12000 });
+    if (!r.ok) return null;
+    const sections = mapUpstreamHome(await r.json());
+    return sections.length ? sections : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Home - full sectioned layout, exactly as moviebox.ph serves it
+app.get('/api/home', async (req, res) => {
+  const toClient = (item) => ({
+    id: item.subject_id,
+    title: item.name || 'Untitled',
+    poster: item.poster_url || '',
+    backdrop: item.image_url || item.poster_url || '',
+    slug: item.slug,
+    badge: item.badge || '',
+    rating: item.rating || null,
+    year: item.year || '',
+    genre: item.genre || '',
+    source: 'moviebox',
+    type: 'moviebox',
+    language: item.language || item.lang || item.locale || '',
+  });
+
+  let sections = (await fetchHomeDirect() || [])
+    .map(s => ({ title: s.section, items: (s.items || []).map(toClient) }))
+    .filter(s => s.items.length > 0);
+
+  if (!sections.length) {
+    // Fallback: Moviebox-API /home (different regional variant, but real data)
+    const data = await movieboxFetch('/home');
+    if (data && Array.isArray(data.sections)) {
+      sections = data.sections
+        .filter(s => s.items && s.items.length > 0)
+        .map(s => ({ title: s.section, items: s.items.map(toClient) }));
+    }
+  }
+  res.json({ sections });
 });
 
-// Home categories — sections grouped by type (movie, tv, animation)
+// Home categories — sections grouped by type (movie, tv, animation), all moviebox
 app.get('/api/home/categories', async (req, res) => {
-  const data = await movieboxFetch('/home/categories');
   const result = { movie: [], tv: [], animation: [] };
+  const toClient = (item) => ({
+    id: item.subject_id,
+    title: item.name || 'Untitled',
+    poster: item.poster_url || '',
+    slug: item.slug,
+    badge: item.badge || '',
+    rating: item.rating || null,
+    source: 'moviebox',
+    type: 'moviebox',
+  });
 
-  if (data && data.categories) {
-    for (const [cat, sections] of Object.entries(data.categories)) {
-      result[cat] = (sections || []).map(s => ({
-        title: s.title,
-        items: (s.items || []).map(item => ({
-          id: item.subject_id,
-          title: item.name || 'Untitled',
-          poster: item.poster_url || '',
-          slug: item.slug,
-          badge: item.badge || '',
-          rating: item.rating || null,
-          source: 'moviebox',
-          type: 'moviebox',
-        }))
-      }));
+  let raw = await fetchHomeDirect();
+  if (raw) {
+    const tvKeywords = ['series', 'drama', 'tv', 'turkish', 'sitcom', 'bl story', 'bet+'];
+    const animKeywords = ['anime', 'animation', 'cartoon'];
+    for (const s of raw) {
+      if (/^banner$/i.test(s.section)) continue;
+      const title = s.section;
+      const tl = title.toLowerCase();
+      const cat = animKeywords.some(k => tl.includes(k)) ? 'animation'
+        : tvKeywords.some(k => tl.includes(k)) ? 'tv' : 'movie';
+      result[cat].push({ title, items: (s.items || []).map(toClient) });
+    }
+  } else {
+    const data = await movieboxFetch('/home/categories');
+    if (data && data.categories) {
+      for (const [cat, sections] of Object.entries(data.categories)) {
+        result[cat] = (sections || []).map(s => ({
+          title: s.title,
+          items: (s.items || []).map(toClient),
+        }));
+      }
     }
   }
-
-  // Add TMDB animation sections for more content — paginate until a healthy number of posters found
-  try {
-    async function collectTmdb(endpoint, maxItems = 20, maxPages = 6) {
-      const collected = [];
-      const seen = new Set();
-      for (let p = 1; p <= maxPages && collected.length < maxItems; p++) {
-        const res = await tmdbFetch(endpoint, { with_genres: '16', sort_by: 'popularity.desc', page: p, include_adult: false });
-        const results = (res?.results || []).map(m => formatTmdbMovie(m, endpoint.includes('/movie') ? 'movie' : 'tv')).filter(m => m.poster);
-        for (const it of results) {
-          if (!seen.has(it.id)) { seen.add(it.id); collected.push(it); if (collected.length >= maxItems) break; }
-        }
-      }
-      return collected;
-    }
-
-    const animeTvItems = await collectTmdb('/discover/tv', 20, 6);
-    const animeMovieItems = await collectTmdb('/discover/movie', 20, 6);
-
-    if (animeTvItems.length) {
-      result.animation.push({ title: 'Popular Anime TV', items: animeTvItems });
-    }
-    if (animeMovieItems.length) {
-      result.animation.push({ title: 'Popular Anime Movies', items: animeMovieItems });
-    }
-  } catch (e) { /* skip TMDB fallback */ }
-
   res.json(result);
 });
 
@@ -974,36 +1007,54 @@ app.get('/api/search/suggest', async (req, res) => {
   res.json({ suggestions: [] });
 });
 
-// Search - Moviebox-API first (has Hindi/Tamil/Telugu), fallback TMDB
+// Search — moviebox only. Upstream returns just a handful of items per call
+// and ranks pasted titles like "X[Hindi][CAM]" poorly, so: strip [tag] noise,
+// merge search pages 1-3, dedupe, and put exact/prefix title matches first.
 app.get('/api/search', async (req, res) => {
-  const q = req.query.q;
-  if (!q) return res.json({ movies: [], total: 0 });
+  const rawQ = String(req.query.q || '').trim();
+  if (!rawQ) return res.json({ movies: [], total: 0 });
+  const cleanQ = rawQ.replace(/\[[^\]]*\]/g, '').replace(/\s+/g, ' ').trim() || rawQ;
 
-  // Try Moviebox-API (has Hindi dubbed content)
-  const data = await movieboxFetch(`/search?q=${encodeURIComponent(q)}`);
-  if (data && data.items && data.items.length > 0) {
-    const movies = data.items.map(item => ({
-      id: item.subject_id,
-      title: item.name,
-      poster: item.poster_url || '',
-      slug: item.slug,
-      year: item.year || '',
-      badge: item.badge || '',
-      rating: item.rating || null,
-      genre: item.genre || '',
-      country: item.country || '',
-      source: 'moviebox',
-      type: 'moviebox',
-    }));
-    return res.json({ movies, total: movies.length });
+  const toMovie = (item) => ({
+    id: item.subject_id,
+    title: item.name,
+    poster: item.poster_url || '',
+    slug: item.slug,
+    year: item.year || '',
+    badge: item.badge || '',
+    rating: item.rating || null,
+    genre: item.genre || '',
+    country: item.country || '',
+    source: 'moviebox',
+    type: 'moviebox',
+  });
+
+  const pages = await Promise.all([1, 2, 3].map(page =>
+    movieboxFetch(`/search?q=${encodeURIComponent(cleanQ)}&page=${page}`)
+  ));
+  const merged = [];
+  const seen = new Set();
+  for (const data of pages) {
+    for (const item of (data?.items || [])) {
+      const key = String(item.subject_id);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      merged.push(toMovie(item));
+    }
   }
 
-  // Fallback to TMDB
-  const tmdb = await tmdbFetch('/search/multi', { query: q, include_adult: false });
-  const movies = (tmdb?.results || [])
-    .filter(r => r.media_type === 'movie' || r.media_type === 'tv')
-    .map(m => formatTmdbMovie(m, m.media_type));
-  res.json({ movies, total: movies.length });
+  // Exact title match first, then prefix, then substring, then the rest
+  const ql = cleanQ.toLowerCase();
+  const score = (t) => {
+    const lt = String(t || '').toLowerCase();
+    if (lt === ql) return 0;
+    if (lt.startsWith(ql)) return 1;
+    if (lt.includes(ql)) return 2;
+    return 3;
+  };
+  merged.sort((a, b) => score(a.title) - score(b.title));
+
+  res.json({ movies: merged, total: merged.length });
 });
 
 // Detail

@@ -399,26 +399,14 @@ async function loadHomePage() {
     return;
   }
 
-  // Hero carousel — pull ONLY from the "Recently Released Movies" collection
-  // (movie-only feed with proper backdrops, year, genre and rating).
+  // Hero carousel — moviebox-style: use the upstream Banner section so the
+  // hero (like everything else) comes only from the moviebox API.
   let heroSlides = [];
-  try {
-    const rec = await apiFetch('/api/recent-movies');
-    heroSlides = (rec.items || []).filter(it => it.type === 'movie' && it.backdrop);
-  } catch (e) { heroSlides = []; }
-
-  // Fallback only if the recent-movies feed is unavailable: use the Banner
-  // section so the hero never renders empty.
   let heroRowTitle = null; // home section hidden from the rows because it's in the hero
-  if (!heroSlides.length) {
-    const banner = sections.find(s => /banner/i.test(s.title));
-    if (banner && banner.items.length) {
-      heroRowTitle = banner.title;
-      banner.items.forEach(it => {
-        const img = it.backdrop || it.poster || '';
-        if (img) heroSlides.push(it);
-      });
-    }
+  const banner = sections.find(s => /banner/i.test(s.title));
+  if (banner && banner.items.length) {
+    heroRowTitle = banner.title;
+    heroSlides = banner.items.filter(it => (it.backdrop || it.poster));
   }
   const hero = heroSlides.length > 0 ? heroSlides[0] : null;
 
@@ -497,9 +485,9 @@ async function loadHomePage() {
     </div>`;
   }
 
-  // Most Trending — infinite-scroll grid at the bottom
+  // Most Watched — infinite-scroll grid at the bottom (upstream ranking feed)
   html += `<div class="movie-row most-trending">
-    <div class="row-header"><h2 class="row-title">🔥 Most Trending</h2></div>
+    <div class="row-header"><h2 class="row-title">🔥 Most Watched</h2></div>
     <div class="mt-grid" id="mtGrid"></div>
     <div class="mt-loading" id="mtLoading">Loading more...</div>
   </div>`;
@@ -851,18 +839,15 @@ async function initMostTrending() {
 }
 
 async function fetchTrendingPage(page) {
-  const cats = ['movie', 'tv', 'animation'];
-  const idx = (page - 1) % cats.length;
-  const cat = cats[idx];
-  const endpoint = cat === 'movie' ? '/api/movies'
-    : cat === 'tv' ? '/api/tv-series' : '/api/animation';
-  const data = await apiFetch(`${endpoint}?page=${page}`);
+  // Upstream Most Watched ranking — same source moviebox uses, not a mix
+  const data = await apiFetch(`/api/ranking?page=${page}`);
   const items = (data.items || []).map(it => ({
     id: it.subject_id,
     title: it.name || 'Untitled',
     poster: it.poster_url || '',
     slug: it.slug,
     badge: it.badge || '',
+    rating: it.rating || null,
     source: 'moviebox',
     type: 'moviebox',
   }));
