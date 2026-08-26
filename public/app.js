@@ -1465,6 +1465,20 @@ async function searchMovies(query) {
     data = await apiFetch(`/api/search?q=${encodeURIComponent(query)}`);
   }
   const movies = data.movies || [];
+
+  // Rescue titles missing from the moviebox catalog (DMCA-removed / blocked):
+  // append TMDB matches — they play through the embed servers. Moviebox
+  // results stay first; duplicates of moviebox titles are skipped.
+  try {
+    const tmdbData = await apiFetch(`/api/tmdb-search?q=${encodeURIComponent(query)}`);
+    const norm = (s) => String(s || '').toLowerCase().replace(/\[[^\]]*\]/g, '').replace(/[^a-z0-9]/g, '');
+    const have = new Set(movies.map(m => norm(m.title)));
+    for (const m of (tmdbData.movies || [])) {
+      if (!m.title || have.has(norm(m.title))) continue;
+      have.add(norm(m.title));
+      movies.push(m);
+    }
+  } catch (e) { /* TMDB is optional */ }
   if (!movies.length) {
     contentArea.innerHTML = `<div class="no-results"><p>No results for "${esc(query)}"</p></div>`;
   } else {

@@ -1007,6 +1007,19 @@ app.get('/api/search/suggest', async (req, res) => {
   res.json({ suggestions: [] });
 });
 
+// TMDB search — used to RESCUE titles missing from the moviebox catalog
+// (DMCA-removed / region-blocked). These play via the embed providers.
+app.get('/api/tmdb-search', async (req, res) => {
+  const q = String(req.query.q || '').trim();
+  if (!q) return res.json({ movies: [] });
+  const cleanQ = q.replace(/\[[^\]]*\]/g, '').replace(/\s+/g, ' ').trim() || q;
+  const tmdb = await tmdbFetch('/search/multi', { query: cleanQ, include_adult: false });
+  const movies = (tmdb?.results || [])
+    .filter(r => r.media_type === 'movie' || r.media_type === 'tv')
+    .map(m => formatTmdbMovie(m, m.media_type));
+  res.json({ movies });
+});
+
 // Search — moviebox only. Upstream returns just a handful of items per call
 // and ranks pasted titles like "X[Hindi][CAM]" poorly, so: strip [tag] noise,
 // merge search pages 1-3, dedupe, and put exact/prefix title matches first.
@@ -1053,6 +1066,22 @@ app.get('/api/search', async (req, res) => {
     return 3;
   };
   merged.sort((a, b) => score(a.title) - score(b.title));
+
+  // Rescue titles missing from the moviebox catalog (DMCA-removed etc.) via
+  // TMDB — they play through the embed providers. Moviebox matches stay first.
+  try {
+    const tmdb = await tmdbFetch('/search/multi', { query: cleanQ, include_adult: false });
+    const norm = (s) => String(s || '').toLowerCase().replace(/\[[^\]]*\]/g, '').replace(/[^a-z0-9]/g, '');
+    const have = new Set(merged.map(m => norm(m.title)));
+    for (const r of (tmdb?.results || [])) {
+      if (r.media_type !== 'movie' && r.media_type !== 'tv') continue;
+      const title = r.title || r.name || '';
+      if (!title || have.has(norm(title))) continue;
+      have.add(norm(title));
+      merged.push(formatTmdbMovie(r, r.media_type));
+      if (merged.length >= 40) break;
+    }
+  } catch (e) { /* TMDB is optional */ }
 
   res.json({ movies: merged, total: merged.length });
 });
