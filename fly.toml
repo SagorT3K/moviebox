@@ -18,7 +18,9 @@ primary_region = 'sin'
   force_https = true
   auto_stop_machines = 'stop'
   auto_start_machines = true
-  min_machines_running = 0
+  # Keep one machine always warm — with 0, the first visitor after an idle
+  # period waits several seconds for a cold start before anything loads.
+  min_machines_running = 1
 
   [http_service.concurrency]
     type = 'connections'

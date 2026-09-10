@@ -52,6 +52,25 @@ const downloadLimit = rateLimit({ windowMs: 60 * 1000, max: 10 });
 const transcodeLimit = rateLimit({ windowMs: 60 * 1000, max: 4 });
 const API_URL = process.env.API_URL || 'http://localhost:8000';
 
+// --- Tiny TTL cache (upstream is slow + rate-limits repeated calls) ---
+// Never caches null/undefined, so a cache miss and a failed upstream call
+// are indistinguishable to callers (both return null → they refetch).
+const ttlCache = new Map(); // key -> { ts, ttl, value }
+function cacheGet(key) {
+  const hit = ttlCache.get(key);
+  if (!hit || Date.now() - hit.ts > hit.ttl) return null;
+  return hit.value;
+}
+function cacheSet(key, value, ttlMs) {
+  if (value === null || value === undefined) return;
+  // Opportunistic cleanup so the map can't grow unbounded
+  if (ttlCache.size > 1000) {
+    const now = Date.now();
+    for (const [k, v] of ttlCache) if (now - v.ts > v.ttl) ttlCache.delete(k);
+  }
+  ttlCache.set(key, { ts: Date.now(), ttl: ttlMs, value });
+}
+
 // TMDB for metadata. Bundled key by default; set TMDB_API_KEY env var to override.
 const TMDB_KEY = process.env.TMDB_API_KEY || '2dca580c2a14b55200e784d157207b4d';
 const TMDB_BASE = 'https://api.themoviedb.org/3';
@@ -135,8 +154,10 @@ async function mbFetchPlay(subjectId, slug, se, ep, forceRefresh = false) {
   const json = await res.json();
   let data = json.data || {};
 
-  // Retry once with a fresh session if upstream served an empty payload
+  // Retry once with a fresh session if upstream served an empty payload —
+  // paced briefly so back-to-back play calls don't trip upstream rate limiting
   if (!forceRefresh && !data.hasResource && !(data.streams || []).length) {
+    await new Promise(r => setTimeout(r, 500));
     data = await mbFetchPlay(subjectId, slug, se, ep, true);
   }
   return data;
@@ -146,6 +167,10 @@ app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.json());
 
 // --- VIDEO PROXY (bypass CORS/Referer) ---
+// NOTE: playing CDN videos directly from the browser is NOT possible — the
+// video hosts require `Referer: https://moviebox.ph/` (anything else gets a
+// 429) and browsers can't spoof Referer. So MP4 playback must keep flowing
+// through this proxy.
 // Allowed CDN domains (add more as needed)
 const ALLOWED_PROXY_HOSTS = [
   'bcdnxw.hakunaymatata.com',
@@ -696,13 +721,19 @@ app.get('/api/genre/:name', async (req, res) => {
 
 // --- Moviebox-API helper ---
 async function movieboxFetch(endpoint) {
+  // Catalog/search/detail payloads are identical across requests for ~a minute;
+  // caching them keeps bursty traffic from hammering (and being rate-limited by) the API.
+  const hit = cacheGet(`mb:${endpoint}`);
+  if (hit !== null) return hit;
   try {
     const headers = {};
     // Optional shared-secret auth (pairs with the API_KEY guard in moviebox-api)
     if (process.env.MOVIEBOX_API_KEY) headers['X-API-Key'] = process.env.MOVIEBOX_API_KEY;
     const res = await fetch(`${MOVIEBOX_API}${endpoint}`, { headers, timeout: 10000 });
     if (!res.ok) throw new Error(`Moviebox-API ${res.status}`);
-    return await res.json();
+    const data = await res.json();
+    cacheSet(`mb:${endpoint}`, data, 60 * 1000);
+    return data;
   } catch (e) {
     console.error(`Moviebox-API error: ${endpoint} - ${e.message}`);
     return null;
@@ -795,12 +826,18 @@ function mapUpstreamHome(data) {
 }
 
 async function fetchHomeDirect() {
+  // Shared by /api/home and /api/home/categories — both hit the homepage at
+  // once, so the direct upstream call is cached briefly.
+  const hit = cacheGet('home-direct');
+  if (hit !== null) return hit;
   try {
     const headers = { ...CDN_HEADERS, 'Accept': 'application/json' };
     const r = await fetch(`${MB_API_BASE}/home?host=moviebox.ph`, { headers, redirect: 'follow', timeout: 12000 });
     if (!r.ok) return null;
     const sections = mapUpstreamHome(await r.json());
-    return sections.length ? sections : null;
+    const out = sections.length ? sections : null;
+    if (out) cacheSet('home-direct', out, 60 * 1000);
+    return out;
   } catch (e) {
     return null;
   }
@@ -1028,6 +1065,11 @@ app.get('/api/search', async (req, res) => {
   if (!rawQ) return res.json({ movies: [], total: 0 });
   const cleanQ = rawQ.replace(/\[[^\]]*\]/g, '').replace(/\s+/g, ' ').trim() || rawQ;
 
+  // Final assembled result (moviebox pages + TMDB rescue) cached per query
+  const searchCacheKey = `search:${cleanQ.toLowerCase()}`;
+  const cachedSearch = cacheGet(searchCacheKey);
+  if (cachedSearch) return res.json(cachedSearch);
+
   const toMovie = (item) => ({
     id: item.subject_id,
     title: item.name,
@@ -1083,7 +1125,9 @@ app.get('/api/search', async (req, res) => {
     }
   } catch (e) { /* TMDB is optional */ }
 
-  res.json({ movies: merged, total: merged.length });
+  const searchPayload = { movies: merged, total: merged.length };
+  cacheSet(searchCacheKey, searchPayload, 60 * 1000);
+  res.json(searchPayload);
 });
 
 // Detail
@@ -1181,6 +1225,12 @@ app.get('/api/stream', async (req, res) => {
   const season = se || 1;
   const episode = ep || 1;
 
+  // Resolving a title costs 1-3 upstream play calls; cache successful
+  // resolutions so repeat plays (and multiple visitors) don't refetch.
+  const cacheKey = `stream:${subject_id}:${slug}:${season}:${episode}`;
+  const cachedPayload = cacheGet(cacheKey);
+  if (cachedPayload) return res.json(cachedPayload);
+
   try {
     const play = await mbFetchPlay(subject_id, slug, season, episode);
     const sources = (play.streams || []).map(s => ({
@@ -1194,7 +1244,7 @@ app.get('/api/stream', async (req, res) => {
     const hasResource = !!play.hasResource && (sources.length > 0 || (play.dash || []).length > 0 || (play.hls || []).length > 0);
 
     if (hasResource) {
-      return res.json({
+      const payload = {
         subject_id,
         se: season,
         ep: episode,
@@ -1205,7 +1255,9 @@ app.get('/api/stream', async (req, res) => {
         free_episodes: play.freeNum,
         limited: play.limited || false,
         note: null,
-      });
+      };
+      cacheSet(cacheKey, payload, 5 * 60 * 1000);
+      return res.json(payload);
     }
   } catch (e) {
     console.error('Direct stream error:', e.message);
@@ -1232,6 +1284,12 @@ app.get('/api/stream', async (req, res) => {
 app.get('/api/dash-manifest', async (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).json({ error: 'Missing url' });
+
+  // VOD manifests are static — cache the parsed result (the player requests
+  // it on every detail page load and quality switch)
+  const cacheKey = `mpd:${url}`;
+  const cachedMpd = cacheGet(cacheKey);
+  if (cachedMpd) return res.json(cachedMpd);
 
   try {
     const response = await fetch(url, {
@@ -1287,12 +1345,14 @@ app.get('/api/dash-manifest', async (req, res) => {
       duration = (parseInt(durMatch[1] || 0) * 3600) + (parseInt(durMatch[2] || 0) * 60) + parseFloat(durMatch[3]);
     }
 
-    res.json({
+    const payload = {
       url: url,
       codec: codec,
       duration: duration,
       resolutions: resolutions.sort((a, b) => b.height - a.height),
-    });
+    };
+    cacheSet(cacheKey, payload, 10 * 60 * 1000);
+    res.json(payload);
   } catch (e) {
     console.error('DASH manifest parse error:', e.message);
     res.status(500).json({ error: 'Failed to parse manifest: ' + e.message });
@@ -1308,6 +1368,11 @@ app.get('/api/stream/:subject_id/captions', async (req, res) => {
   const season = se || 1;
   const episode = ep || 1;
   const empty = { subject_id, se: season, ep: episode, count: 0, captions: [] };
+
+  // Caption lists are static per episode — cache successful lookups
+  const cacheKey = `caps:${subject_id}:${detail_path}:${season}:${episode}`;
+  const cachedCaps = cacheGet(cacheKey);
+  if (cachedCaps) return res.json(cachedCaps);
 
   try {
     const play = await mbFetchPlay(subject_id, detail_path, season, episode);
@@ -1334,7 +1399,9 @@ app.get('/api/stream/:subject_id/captions', async (req, res) => {
       const capData = await capRes.json();
       const inner = capData.data;
       const captions = (inner && inner.captions) || (Array.isArray(inner) ? inner : []);
-      return res.json({ subject_id, se: season, ep: episode, count: captions.length, captions });
+      const capsPayload = { subject_id, se: season, ep: episode, count: captions.length, captions };
+      if (captions.length) cacheSet(cacheKey, capsPayload, 10 * 60 * 1000);
+      return res.json(capsPayload);
     }
   } catch (e) {
     console.error('Direct captions error:', e.message);
