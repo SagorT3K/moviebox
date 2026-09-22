@@ -6,6 +6,13 @@ const os = require('os');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 const https = require('https');
+const http = require('http');
+
+// Keep-alive agents for the video CDN: reuse TLS connections instead of a
+// fresh handshake per range request, and no body timeout (video bodies stream
+// for minutes; only the connect/headers wait is bounded inside proxyStream).
+const cdnHttpsAgent = new https.Agent({ keepAlive: true, maxSockets: 64, maxFreeSockets: 16, timeout: 15000 });
+const cdnHttpAgent = new http.Agent({ keepAlive: true, maxSockets: 64, maxFreeSockets: 16, timeout: 15000 });
 
 const app = express();
 // Fly's proxy terminates TLS and sets X-Forwarded-For; trust exactly one hop
@@ -186,118 +193,118 @@ const ALLOWED_PROXY_HOSTS = [
   'h5-api.aoneroom.com',
 ];
 
-app.get('/api/proxy', proxyLimit, async (req, res) => {
-  const { url } = req.query;
-  if (!url) return res.status(400).send('Missing url');
-
-  // Validate URL — only allow known CDN hosts
+// Native streaming proxy shared by /api/proxy and /api/download.
+// - No body timeout: bodies stream for minutes; only the connect/headers
+//   wait is bounded (15s). node-fetch's `timeout` option also covered the
+//   body, which truncated slow video streams.
+// - Keep-alive agents: range requests reuse TLS connections.
+// - HEAD: answers headers only, never downloads the body (old code ran the
+//   full GET handler, so HEAD hung until timeout).
+// - Client disconnect aborts the upstream request.
+function proxyStream(upstreamUrl, req, res, opts = {}, redirectCount = 0) {
+  let parsed;
   try {
-    const parsed = new URL(url);
+    parsed = new URL(upstreamUrl);
     const host = parsed.hostname;
-    const isAllowed = ALLOWED_PROXY_HOSTS.some(h => host === h || host.endsWith('.' + h));
-    if (!isAllowed) {
-      return res.status(403).send('Host not allowed');
+    const ok = ALLOWED_PROXY_HOSTS.some(h => host === h || host.endsWith('.' + h));
+    if (!ok) {
+      if (!res.headersSent) res.status(403).send('Host not allowed');
+      return;
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      if (!res.headersSent) res.status(400).send('Invalid URL');
+      return;
     }
   } catch (e) {
-    return res.status(400).send('Invalid URL');
+    if (!res.headersSent) res.status(400).send('Invalid URL');
+    return;
   }
 
-  try {
-    // Forward range header for seeking support
-    const proxyHeaders = { ...CDN_HEADERS };
-    if (req.headers.range) {
-      proxyHeaders['Range'] = req.headers.range;
+  const isHttps = parsed.protocol === 'https:';
+  const lib = isHttps ? https : http;
+  const agent = isHttps ? cdnHttpsAgent : cdnHttpAgent;
+  const isHead = req.method === 'HEAD';
+
+  const headers = { ...CDN_HEADERS, 'Accept-Encoding': 'identity' };
+  if (!isHead && req.headers.range) {
+    headers['Range'] = req.headers.range;
+  }
+
+  const upReq = lib.request(upstreamUrl, { method: isHead ? 'HEAD' : 'GET', headers, agent }, (upRes) => {
+    // Follow a few redirects manually (native https doesn't), re-validating host.
+    if (upRes.statusCode >= 300 && upRes.statusCode < 400 && upRes.headers.location && redirectCount < 3) {
+      upRes.resume();
+      try {
+        return proxyStream(new URL(upRes.headers.location, upstreamUrl).toString(), req, res, opts, redirectCount + 1);
+      } catch (e) {
+        if (!res.headersSent) res.status(400).send('Invalid URL');
+        return;
+      }
     }
 
-    const response = await fetch(url, {
-      headers: proxyHeaders,
-      redirect: 'follow',
-      timeout: 30000,
-    });
-
-    if (!response.ok && response.status !== 206) {
-      return res.status(response.status).send(`Upstream error: ${response.status}`);
+    if (upRes.statusCode !== 200 && upRes.statusCode !== 206) {
+      upRes.resume();
+      if (!res.headersSent) res.status(upRes.statusCode).send(`Upstream error: ${upRes.statusCode}`);
+      return;
     }
 
-    // Forward content type
-    const contentType = response.headers.get('content-type');
+    const contentType = upRes.headers['content-type'] || opts.defaultType;
     if (contentType) res.setHeader('Content-Type', contentType);
-
-    // Forward content length for progress
-    const contentLength = response.headers.get('content-length');
-    if (contentLength) res.setHeader('Content-Length', contentLength);
-
-    // Forward content range for partial responses
-    const contentRange = response.headers.get('content-range');
-    if (contentRange) res.setHeader('Content-Range', contentRange);
-
-    // Allow range requests for seeking
+    if (upRes.headers['content-length']) res.setHeader('Content-Length', upRes.headers['content-length']);
+    if (upRes.headers['content-range']) res.setHeader('Content-Range', upRes.headers['content-range']);
+    if (upRes.headers['etag']) res.setHeader('ETag', upRes.headers['etag']);
+    if (upRes.headers['last-modified']) res.setHeader('Last-Modified', upRes.headers['last-modified']);
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Access-Control-Allow-Origin', '*');
-
-    // Forward status 206 (Partial Content) for range requests
-    if (response.status === 206) {
-      res.status(206);
+    if (opts.attachmentTitle) {
+      const ct = (upRes.headers['content-type'] || '').toLowerCase();
+      const ext = ct.includes('webm') ? '.webm' : '.mp4';
+      res.setHeader('Content-Disposition', `attachment; filename="${opts.attachmentTitle}${ext}"`);
+    } else if (opts.attachment) {
+      res.setHeader('Content-Disposition', `attachment; filename="${opts.attachment}"`);
     }
 
-    // Stream the video
-    response.body.pipe(res);
-  } catch (e) {
+    res.status(upRes.statusCode === 206 ? 206 : 200);
+    res.flushHeaders();
+
+    if (isHead) {
+      upRes.resume();
+      res.end();
+      return;
+    }
+
+    upRes.pipe(res);
+    upRes.on('error', () => { try { res.destroy(); } catch (e) {} });
+  });
+
+  // Bounded connect/headers wait only — never applied to the streaming body.
+  upReq.setTimeout(15000, () => { upReq.destroy(new Error('Upstream connect timeout')); });
+  upReq.on('error', (e) => {
     console.error('Proxy error:', e.message);
-    res.status(500).send('Proxy failed');
-  }
+    if (res.headersSent) { try { res.destroy(); } catch (err) {} return; }
+    res.status(502).send('Proxy failed');
+  });
+  req.on('close', () => {
+    if (!res.writableFinished) { try { upReq.destroy(); } catch (e) {} }
+  });
+  upReq.end();
+}
+
+app.get('/api/proxy', proxyLimit, (req, res) => {
+  const { url } = req.query;
+  if (!url || typeof url !== 'string') return res.status(400).send('Missing url');
+  proxyStream(url, req, res);
 });
 
 // --- VIDEO DOWNLOAD (sets Content-Disposition: attachment) ---
-app.get('/api/download', downloadLimit, async (req, res) => {
+app.get('/api/download', downloadLimit, (req, res) => {
   const { url, title } = req.query;
-  if (!url) return res.status(400).send('Missing url');
+  if (!url || typeof url !== 'string') return res.status(400).send('Missing url');
 
-  // Validate URL — only allow known CDN hosts
-  try {
-    const parsed = new URL(url);
-    const host = parsed.hostname;
-    const isAllowed = ALLOWED_PROXY_HOSTS.some(h => host === h || host.endsWith('.' + h));
-    if (!isAllowed) {
-      return res.status(403).send('Host not allowed');
-    }
-  } catch (e) {
-    return res.status(400).send('Invalid URL');
-  }
+  // Build filename from title (extension picked from upstream content-type)
+  const cleanTitle = (title || 'download').replace(/[^\w\s\-]/g, '').replace(/\s+/g, '_').substring(0, 80);
 
-  try {
-    const proxyHeaders = { ...CDN_HEADERS };
-
-    const response = await fetch(url, {
-      headers: proxyHeaders,
-      redirect: 'follow',
-      timeout: 60000,
-    });
-
-    if (!response.ok) {
-      return res.status(response.status).send(`Upstream error: ${response.status}`);
-    }
-
-    // Build filename from title
-    const cleanTitle = (title || 'download').replace(/[^\w\s\-]/g, '').replace(/\s+/g, '_').substring(0, 80);
-    const contentType = response.headers.get('content-type') || 'video/mp4';
-    const ext = contentType.includes('mp4') ? '.mp4' : contentType.includes('webm') ? '.webm' : '.mp4';
-    const filename = `${cleanTitle}${ext}`;
-
-    // Content-Length for progress
-    const contentLength = response.headers.get('content-length');
-    if (contentLength) res.setHeader('Content-Length', contentLength);
-
-    res.setHeader('Content-Type', contentType);
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-
-    response.body.pipe(res);
-  } catch (e) {
-    console.error('Download error:', e.message);
-    res.status(500).send('Download failed');
-  }
+  proxyStream(url, req, res, { attachmentTitle: cleanTitle, defaultType: 'video/mp4' });
 });
 
 // --- HEVC -> H.264 TRANSCODE ----
